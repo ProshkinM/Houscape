@@ -61,6 +61,11 @@ test('les parcours principaux de l editeur sont traduits en russe', () => {
   const keys = [
     'planToolStairs', 'planToolFurniture', 'planStartTitle', 'planFurnitureSearch',
     'tabPartsDesc', 'tabEffectsDesc', 'camSave', 'tabSettingsDesc', 'cfgLang',
+    'backAnchors', 'sheetWhat', 'anchorFieldKind', 'sheetKindEntity',
+    'sheetPickDevice', 'sheetLook', 'anchorFieldIcon', 'anchorFieldColor',
+    'sheetTap', 'anchorTapDefault', 'anchorTapToggle', 'anchorTapMoreInfo',
+    'anchorTapActivate', 'anchorTapPlayPause', 'anchorTapNone',
+    'anchorSectionVisibility', 'partChangeSensor', 'cfgQuality', 'ruleModalSave',
   ];
   try {
     setLang('en');
