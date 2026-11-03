@@ -1,0 +1,266 @@
+<!doctype html>
+<!--
+  Banc d'essai des ouvrants, sur le vrai modèle.
+
+  Charge le GLB de la maison, retrouve une porte par ses proportions, la
+  détache et l'anime — sans Home Assistant, sans dashboard. C'est le seul
+  moyen de vérifier le câblage complet avant de toucher à la production.
+-->
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <title>Houscape — ouvrants</title>
+  <style>
+    body { margin: 0; background: #0b1020; color: #e2e8f0;
+           font: 13px/1.6 system-ui, sans-serif; }
+    #log { padding: 12px 16px; white-space: pre-wrap; font-family: ui-monospace, monospace;
+           font-size: 12px; border-bottom: 1px solid #1e293b; }
+    .ok { color: #4ade80; } .ko { color: #f87171; } .info { color: #94a3b8; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="log"></div>
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+    import { buildPartIndex, partFrame, guessPart } from '/src/parts.ts';
+    import { PartController, meshOrder } from '/src/parts-runtime.ts';
+
+    const logEl = document.getElementById('log');
+    const say = (msg, cls = 'info') => {
+      logEl.insertAdjacentHTML('beforeend', `<div class="${cls}">${msg}</div>`);
+    };
+    const check = (label, cond, detail = '') => {
+      say(`${cond ? '✓' : '✗'} ${label}${detail ? ` — ${detail}` : ''}`, cond ? 'ok' : 'ko');
+      return cond;
+    };
+
+    // `dev/model.local.glb` n'est pas versionné : copiez-y votre GLB, ou passez
+    // ?model=… en paramètre. Un modèle servi par Home Assistant serait refusé
+    // par CORS depuis l'origine du serveur de dev.
+    const MODEL = new URLSearchParams(location.search).get('model')
+      ?? '/dev/model.local.glb';
+
+    say(`Chargement de ${MODEL}…`);
+    const t0 = performance.now();
+    const gltf = await new GLTFLoader().loadAsync(MODEL);
+    say(`Modèle chargé en ${(performance.now() - t0).toFixed(0)} ms`);
+
+    const root = gltf.scene;
+    const meshes = meshOrder(root);
+    say(`${meshes.length} mailles — noms : ${meshes.slice(0, 4).map((m) => m.name).join(', ')}…`);
+
+    // ── Trouver une porte, comme le ferait un clic dans l'éditeur ────────────
+    const tA = performance.now();
+    let best = null;
+    meshes.forEach((mesh, meshIndex) => {
+      const idx = buildPartIndex(mesh.geometry);
+      for (const part of idx.parts) {
+        if (guessPart(part.box, 1) !== 'door') continue;
+        if (!best || part.tris.length > best.part.tris.length) {
+          best = { mesh, meshIndex, part, triangle: part.tris[0] };
+        }
+      }
+    });
+    say(`Analyse des ${meshes.length} mailles : ${(performance.now() - tA).toFixed(0)} ms`);
+
+    if (!check('une porte est reconnue dans le modèle', !!best)) throw new Error('stop');
+    const f = partFrame(best.part.box);
+    say(`Porte : ${f.size[f.up].toFixed(0)} × ${f.size[f.wide].toFixed(0)} × ${f.size[f.thin].toFixed(0)} cm, `
+      + `maille « ${best.mesh.name} » (rang ${best.meshIndex}), triangle ${best.triangle}`);
+
+    // ── Le contrôleur, exactement comme en production ────────────────────────
+    const cfg = {
+      id: 'p1', entity: 'binary_sensor.porte_entree',
+      mesh: best.mesh.name, meshIndex: best.meshIndex, triangle: best.triangle,
+      motion: 'swing', hinge: 'start', angle: 90, duration: 1,
+      // La detection par contenance est optionnelle : le banc l'exerce, mais
+      // une scene reelle ne l'active que si l'utilisateur la coche.
+      carry: true,
+    };
+    const ctl = new PartController();
+    // On compte les triangles **dessines**, pas la longueur de l'index.
+    //
+    // Un triangle retire est rendu degenere — ses trois coins sur un meme
+    // sommet — et non supprime de l'index : compacter celui-ci renumeroterait
+    // tous les suivants, et le triangle d'amorce d'un second ouvrant de la meme
+    // maille designerait alors une autre piece. L'index garde donc sa longueur,
+    // ce que l'ancienne mesure prenait pour un echec.
+    const drawn = (mesh) => {
+      const ix = mesh.geometry.getIndex();
+      let n = 0;
+      for (let t = 0; t < ix.count / 3; t++) {
+        const a = ix.getX(t * 3), b = ix.getX(t * 3 + 1), c = ix.getX(t * 3 + 2);
+        if (a !== b || b !== c) n++;
+      }
+      return n;
+    };
+    const trisBefore = drawn(best.mesh);
+    const res = ctl.build(root, [cfg]);
+    const trisAfter = drawn(best.mesh);
+
+    check('le contrôleur retrouve la pièce depuis la scène', res.ok === 1,
+      `${res.missing.length} manquante(s)`);
+    check('le vantail ne se dessine plus dans la maille d’origine',
+      trisBefore - trisAfter === best.part.tris.length,
+      `${trisBefore} → ${trisAfter}`);
+
+    // ── Entrainement par contenance ───────────────────────────────
+    // Une poignee n'est ni soudee au vantail ni groupee avec lui : seule sa
+    // place dans le volume de l'ouvrant dit qu'elle doit suivre.
+    const emmenees = ctl.carried.get('p1') ?? [];
+    check('des pieces contenues sont emmenees', emmenees.length > 0,
+      emmenees.length + ' : ' + (emmenees.join(', ') || '(aucune)'));
+
+    // Elles doivent bouger avec la porte, pas rester en place.
+    const suivi = emmenees.length ? (() => {
+      let o = null;
+      root.traverse((x) => { if (!o && x.name === emmenees[0]) o = x; });
+      if (!o) return null;
+      const avant = new THREE.Vector3();
+      root.updateMatrixWorld(true); o.getWorldPosition(avant);
+      // `preview` pose la cible ; c'est `update` qui anime jusqu'a elle.
+      ctl.preview('p1', 1);
+      for (let i = 0; i < 200 && ctl.update(0.1); i++);
+      const apres = new THREE.Vector3();
+      root.updateMatrixWorld(true); o.getWorldPosition(apres);
+      ctl.preview('p1', 0);
+      for (let i = 0; i < 200 && ctl.update(0.1); i++);
+      return avant.distanceTo(apres);
+    })() : null;
+    check('la piece emmenee suit l\u2019ouverture', suivi !== null && suivi > 1e-3,
+      suivi === null ? 'aucune piece' : suivi.toFixed(2) + ' unites');
+
+    const leaf = best.mesh.children.find((c) => c.userData.houscapePartId === 'p1');
+    check('le vantail est un objet à part entière', !!leaf);
+
+    // ── Animation ───────────────────────────────────────────────────────────
+    const angleOf = () => Math.abs(leaf.rotation[['x', 'y', 'z'][partFrame(best.part.box).up]]);
+    check('la porte est fermée au départ', angleOf() < 1e-9);
+
+    ctl.applyStates({ 'binary_sensor.porte_entree': { state: 'on' } });
+    ctl.update(0.5);
+    const half = angleOf();
+    check('à mi-durée, la porte est entrouverte', half > 0.1 && half < Math.PI / 2 - 0.1,
+      `${THREE.MathUtils.radToDeg(half).toFixed(0)}°`);
+
+    let guard = 0;
+    while (ctl.update(0.1) && guard++ < 200);
+    check('elle finit grande ouverte', Math.abs(angleOf() - Math.PI / 2) < 1e-6,
+      `${THREE.MathUtils.radToDeg(angleOf()).toFixed(1)}°`);
+    check('l’animation s’arrête d’elle-même', ctl.update(0.1) === false);
+
+    ctl.applyStates({ 'binary_sensor.porte_entree': { state: 'off' } });
+    guard = 0;
+    while (ctl.update(0.1) && guard++ < 200);
+    check('elle se referme complètement', angleOf() < 1e-9);
+
+    // ── Le gond reste immobile ──────────────────────────────────────────────
+    root.updateMatrixWorld(true);
+    const hingeClosed = leaf.localToWorld(new THREE.Vector3(0, 0, 0));
+    ctl.preview('p1', 1);
+    guard = 0;
+    while (ctl.update(0.1) && guard++ < 200);
+    root.updateMatrixWorld(true);
+    const hingeOpen = leaf.localToWorld(new THREE.Vector3(0, 0, 0));
+    check('le gond ne se déplace pas', hingeClosed.distanceTo(hingeOpen) < 1e-6,
+      `${hingeClosed.distanceTo(hingeOpen).toExponential(1)} cm`);
+
+    // ── Rendu réel : la scène doit dessiner sans erreur WebGL ────────────────
+    const renderer = new THREE.WebGLRenderer({ antialias: false });
+    renderer.setSize(640, 400);
+    document.body.appendChild(renderer.domElement);
+    const box = new THREE.Box3().setFromObject(root);
+    const size = box.getSize(new THREE.Vector3()).length();
+    const centre = box.getCenter(new THREE.Vector3());
+    const cam = new THREE.PerspectiveCamera(50, 640 / 400, size / 1000, size * 10);
+    cam.position.copy(centre).add(new THREE.Vector3(size * 0.4, size * 0.4, size * 0.4));
+    cam.lookAt(centre);
+    const scene = new THREE.Scene();
+    scene.add(new THREE.AmbientLight(0xffffff, 2));
+    scene.add(root);
+    renderer.render(scene, cam);
+    check('la scène se rend sans erreur WebGL', true);
+
+    // ── Coût d'une image avec un ouvrant en mouvement ────────────────────────
+    ctl.preview('p1', 0);
+    const tF = performance.now();
+    for (let i = 0; i < 60; i++) { ctl.update(1 / 60); renderer.render(scene, cam); }
+    const perFrame = (performance.now() - tF) / 60;
+    say(`Coût moyen d’une image, porte en mouvement : ${perFrame.toFixed(2)} ms`, 'info');
+
+    // ── Contrôle visuel : cadrer l'ouvrant et le faire jouer en boucle ───────
+    // Un test peut affirmer qu'un angle vaut 90° sans que le résultat ait l'air
+    // d'une porte. Seul l'œil tranche.
+    // Une porte intérieure est cachée par les murs vue du dehors : on n'affiche
+    // que la maille qui la contient.
+    for (const m of meshes) m.visible = (m === best.mesh);
+
+    const leafBox = new THREE.Box3().setFromObject(leaf);
+    const leafCentre = leafBox.getCenter(new THREE.Vector3());
+    const reach = leafBox.getSize(new THREE.Vector3()).length() * 1.6;
+    cam.position.copy(leafCentre).add(new THREE.Vector3(reach, reach * 0.35, reach));
+    cam.near = reach / 100; cam.far = reach * 40;
+    cam.updateProjectionMatrix();
+    cam.lookAt(leafCentre);
+
+    let open = false, wait = 0;
+    const spin = () => {
+      const dt = 1 / 60;
+      if (!ctl.update(dt) && (wait += dt) > 1.2) {
+        wait = 0; open = !open;
+        ctl.preview('p1', open ? 1 : 0);
+      }
+      renderer.render(scene, cam);
+      requestAnimationFrame(spin);
+    };
+    spin();
+
+    // ── Réglages en direct, sans reconstruction ─────────────────────────────
+    // `leaf` est le nœud pivot ; la géométrie du vantail vit un cran plus bas.
+    const node = leaf;
+    const panel = leaf.children[0];
+    const geomBefore = panel.geometry;
+    const trisBase = best.mesh.geometry.getIndex().count;
+    const settle = () => { let g = 0; while (ctl.update(0.1) && g++ < 300); };
+
+    ctl.configure({ ...cfg, angle: 30 });
+    ctl.preview('p1', 1); settle();
+    const deg = Math.abs(node.rotation[['x','y','z'][partFrame(best.part.box).up]]) * 180 / Math.PI;
+    check('un changement d’angle prend effet sans enregistrer',
+      Math.abs(deg - 30) < 0.01, `${deg.toFixed(1)}°`);
+    check('la géométrie n’a pas été redécoupée',
+      panel.geometry === geomBefore && best.mesh.geometry.getIndex().count === trisBase);
+
+    ctl.configure({ ...cfg, motion: 'slide', slide: 'up', travel: 1 });
+    ctl.preview('p1', 1); settle();
+    check('passer en coulissant change le mouvement en direct',
+      node.rotation.x === 0 && node.rotation.y === 0 && node.rotation.z === 0);
+
+    ctl.configure({ ...cfg });
+    ctl.preview('p1', 0); settle();
+
+    // ── Lecture d'état ──────────────────────────────────────────────────────
+    const { openFraction, hasOpenSemantics } = await import('/src/parts-runtime.ts');
+    check('un capteur numérique ne laisse pas la porte béante',
+      openFraction('sensor.temperature', '21.4', { unit_of_measurement: '°C' }) === 0);
+    check('un capteur d’ouverture est compris tout seul',
+      openFraction('binary_sensor.porte', 'on', { device_class: 'door' }) === 1);
+    check('un volet à 40 % s’affiche à 40 %',
+      openFraction('cover.volet', 'open', { current_position: 40 }) === 0.4);
+    check('les états choisis à la main priment',
+      openFraction('sensor.contact', 'Ouvert', {}, ['Ouvert']) === 1
+      && openFraction('sensor.contact', 'Fermé', {}, ['Ouvert']) === 0);
+    check('l’éditeur sait quand réclamer un choix explicite',
+      hasOpenSemantics('cover.x') && !hasOpenSemantics('sensor.x'));
+
+    // Exposé pour piloter le rendu depuis la console : `requestAnimationFrame`
+    // ne tourne pas quand l'onglet ne compose pas d'images.
+    window.__h = { ctl, renderer, scene, cam, leaf, THREE };
+
+    say('\nTerminé. La porte joue en boucle ci-dessous.', 'ok');
+    window.__done = true;
+  </script>
+</body>
+</html>

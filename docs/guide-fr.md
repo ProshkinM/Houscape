@@ -1,0 +1,479 @@
+# Houscape — guide complet
+
+🇬🇧 [English version](guide.md) · ← [Retour au README](../README-FR.md)
+
+- [Dessiner sa maison](#dessiner-sa-maison)
+- [Étages et escaliers](#étages-et-escaliers)
+- [Apparence](#apparence)
+- [Importer votre plan](#importer-votre-plan)
+- [Navigation dans la scène](#navigation-dans-la-scène)
+- [Ancres](#ancres)
+- [Ouvrants](#ouvrants)
+- [Effets](#effets)
+- [Vues caméra](#vues-caméra)
+- [Moteur de règles](#moteur-de-règles)
+- [Environnement](#environnement)
+- [Rendu et apparence](#rendu-et-apparence)
+- [Raccourcis clavier (mode édition)](#raccourcis-clavier-mode-édition)
+- [Configuration YAML complète](#configuration-yaml-complète)
+
+---
+
+## Dessiner sa maison
+
+<p align="center">
+  <img src="../assets/draw.gif" alt="Partir d'un modèle, ajouter une fenêtre et pousser un mur pendant que la 3D suit" width="700" />
+</p>
+
+Cliquez sur **Dessiner mon logement** sur la carte, ou ouvrez l'éditeur avec le crayon et choisissez l'onglet **Plan**. Le plan est à gauche, la 3D à droite ; **Plan**, **Plan + 3D** et **3D** passent de l'un à l'autre.
+
+- **Pour commencer** : une page blanche, un modèle (studio, une ou deux chambres, maison, meublés), ou **Depuis une image** : chargez un plan ou une photo, réglez son échelle en mesurant une longueur connue, et dessinez par-dessus.
+- **Pièce** (R) : tirez un rectangle. **Mur** (M) : cliquez point après point, tapez une longueur au clavier si besoin, refermez sur un coin pour finir. **Limite** (L) : une ligne invisible qui sépare un espace ouvert en deux pièces (une cuisine ouverte et un salon).
+- **Porte** (P), **Fenêtre** (F), **Baie** (B), **Passage** (O) : cliquez sur un mur. Faites-les glisser le long du mur ; inversez le côté des gonds ou le sens d'ouverture dans leur bulle.
+- **Meubles** (N) : plus de 200 meubles, rangés par pièce. Glissez-en un sur le plan ; il s'aimante aux murs et aux coins, et un petit objet posé sur une table reste dessus (Alt pour le placer librement). **Mes meubles** accueille vos propres fichiers GLB ou OBJ. Une lampe peut être reliée à une lumière de Home Assistant : son abat-jour s'allume avec elle.
+- **Sélection** (V) : faites glisser un mur, un coin, une porte ou un meuble. Une pièce isolée se déplace d'un bloc. Double-cliquez sur une pièce pour la renommer, clic droit pour plus de choix. **Gomme** (E) efface ce que vous touchez.
+- Sélectionnez une pièce pour régler son sol (uni, parquet, carrelage, béton, moquette), sa couleur et celle de ses murs.
+- **Mon logement**, sans rien de sélectionné : hauteur et épaisseur des murs, image à décalquer et import Sweet Home 3D.
+
+Tout est enregistré au fur et à mesure ; **Ctrl+Z** et **Ctrl+Y** annulent et rétablissent.
+
+> Nommez vos pièces comme vos pièces de Home Assistant : dans **Appareils**, **Poser les appareils de chaque pièce** place alors les lampes, capteurs et prises de chaque pièce dans la pièce du plan du même nom.
+
+---
+
+## Étages et escaliers
+
+<p align="center">
+  <img src="../assets/floors.gif" alt="Ajouter un étage et un escalier en L, puis passer d'un étage à l'autre sur la carte" width="700" />
+</p>
+
+- **Ajoutez un étage** avec **+** dans la barre des niveaux, en haut à gauche du plan. Il reprend les murs et les pièces du niveau du dessous ; retirez ou déplacez ce qui change. Le niveau du dessous apparaît en pointillés, pour dessiner pile au-dessus. Touchez l'étage actif pour le renommer.
+- **Escalier** (H) : cliquez là où il commence. Dans sa bulle, choisissez la **forme** (droit, en L, en U, colimaçon), le côté où il **tourne**, la **largeur** (ou le **rayon** d'un colimaçon) et la **pente** (douce, normale, raide). Le nombre de marches et la longueur découlent de la hauteur : une marche ne dépasse jamais 20 cm. **Tourner** le fait pivoter d'un quart de tour, **Retourner** inverse le sens de montée.
+- L'étage du dessus reçoit une **trémie** avec un **garde-corps**, ouverte du côté où l'on arrive. Sur son plan, la trémie est barrée.
+- Sur la carte, le choix d'étage de la barre des pièces passe d'un niveau à l'autre ; les étages au-dessus de celui qu'on regarde sont masqués. Un toit en pente se voit au dernier étage, murs debout.
+- Une pièce aux murs bas (moins de 1,30 m, comme un balcon) reste à ciel ouvert ; un toit plat reçoit un muret.
+
+---
+
+## Apparence
+
+<p align="center">
+  <img src="../assets/look.gif" alt="Essayer des styles de maison, puis la maison avec son toit sous un ciel nuageux" width="700" />
+</p>
+
+L'onglet **Apparence** rassemble tout ce qui se voit.
+
+- **Styles tout faits** : enduit clair, brique, bois, pierre, moderne, sombre. Un clic règle la façade, le soubassement, le toit, le jardin et la couleur du sol.
+- **Maison** : couleur et matière de la façade (lisse, enduit, brique, bois, pierre), un soubassement plus sombre, le toit (ouvert pour voir dedans, ou en pente) et sa couverture (tuiles, ardoise, zinc). Ces réglages appartiennent à la maison dessinée et valent pour tous les étages.
+- **Terrain** : un jardin (aucun, quelques arbres, fourni), le style du sol (carré, disque, podium, infini, aucun), sa couleur et sa taille, un fond transparent.
+- **Ciel et lumière** : le ciel, l'intensité du soleil et de l'ambiance, l'exposition et les ombres, puis les entités soleil et météo et la simulation de l'heure (voir [Environnement](#environnement)).
+
+Le ciel est **Automatique** par défaut : dégagé par beau temps, quelques nuages par temps variable (ou sans entité météo), couvert quand il pleut, neige ou qu'il y a du brouillard, et il suit le jour, le crépuscule et la nuit. **Dégagé** et **Nuageux** gardent le même ciel quel que soit le temps ; **Studio sombre** est un fond sombre uni ; **Simple** est l'ancien dégradé.
+
+---
+
+## Importer votre plan
+
+[▶ Voir la vidéo de l'import](https://www.youtube.com/watch?v=4hBuNCvALFA) (2 min, en anglais).
+
+Glissez votre plan sur la carte, ou cliquez sur **Importer mon plan** (bandeau de la démo, ou haut de l'onglet **Config** de l'éditeur) et choisissez les fichiers. La carte accepte :
+
+- le dossier exporté par **Sweet Home 3D** (**Vue 3D → Exporter au format OBJ**), ses fichiers sélectionnés ensemble, ou un zip de ce dossier ;
+- un fichier `.glb`. Un `.gltf` ne s'importe pas tel quel : exportez plutôt un `.glb`.
+
+La conversion se fait dans votre navigateur, textures comprises. Le modèle est ensuite envoyé à Home Assistant, rangé dans `config/houscape/models/` et affiché aussitôt. Seuls les administrateurs peuvent importer ; la limite est de 300 Mo.
+
+### Alléger un plan lourd
+
+Quand un plan est lourd pour une tablette murale (plus de 150 000 triangles, ou des textures de plus de 1024 px), la carte propose de l'alléger avant la conversion, et affiche le gain attendu :
+
+- les **petits objets très détaillés** (vaisselle, plantes, robinets) sont simplifiés, à 1 % de leur taille près ;
+- les **grandes textures** sont réduites à 1024 px.
+
+Murs, sols, portes et fenêtres ne sont jamais touchés : ouvrants et ancres restent exacts. L'option est décochée par défaut ; la carte retient votre dernier choix.
+
+### Portes et fenêtres repérées pour vous
+
+Sweet Home 3D nomme les gonds et les parties mobiles de ses portes et fenêtres. À l'import, la carte transforme chaque porte et fenêtre en ouvrant tout réglé : gonds du bon côté, ouverture vers l'intérieur du logement, vantaux coulissants l'un vers l'autre. Les portes de placard et d'électroménager sont laissées de côté. Il ne reste qu'à choisir le capteur de chaque ouvrant dans l'onglet **Ouvrants**.
+
+Si la scène a déjà des ouvrants, la carte demande : **Garder les miens**, **Ajouter les nouveaux** ou **Remplacer**. Remplacer garde le capteur, le nom, les couleurs et le sens de chaque porte ou fenêtre encore présente, et retire les ouvrants de l'ancien modèle. Le même choix existe dans l'onglet **Ouvrants**.
+
+### Importer à nouveau
+
+Glissez à nouveau votre plan après l'avoir retouché dans Sweet Home 3D : ancres, règles, cartes et vues caméra sont gardées, et la caméra cadre le nouveau modèle. Importer par-dessus la maison de démo repart d'une scène vierge. Un plan importé passe devant le `model_url` de la carte.
+
+---
+
+## Navigation dans la scène
+
+| Action | Souris | Tactile |
+|---|---|---|
+| Orbiter | Clic gauche + glisser | Un doigt + glisser |
+| Zoomer | Molette | Pincer |
+| Panoramique | Clic droit + glisser | Deux doigts + glisser |
+
+---
+
+## Ancres
+
+Les ancres sont des points interactifs placés dans la scène 3D. Chaque ancre est liée à une entité Home Assistant.
+
+<p align="center">
+  <img src="../assets/devices.gif" alt="Déplacement d'une ancre dans l'éditeur" width="600" />
+</p>
+
+### Domaines supportés
+
+| Domaine | Comportement | Visuel |
+|---|---|---|
+| `light` | Crée une lumière 3D synchronisée (couleur + intensité) | Point lumineux avec ombre |
+| `switch` | On/off toggle | Icône interrupteur |
+| `sensor` | Affiche la valeur en temps réel | Étiquette avec valeur |
+| `binary_sensor` | Indicateur on/off | Point coloré |
+| `cover` | Reflète le % d'ouverture | Barre de progression |
+| `climate` | Indicateur de mode (chauffage/refroidissement) | Orange/bleu selon l'action |
+| `media_player` | Indicateur lecture/pause | Icône media |
+
+
+### Styles de lumière
+
+Pour les entités `light`, trois styles sont disponibles :
+
+| Style | Description |
+|---|---|
+| `point` | Lumière omnidirectionnelle (ampoule classique) |
+| `spot` | Faisceau conique dirigé (spot encastré) |
+| `beam` | Faisceau étroit et concentré (projecteur) |
+| `mesh` | **Forme objet** : une lumière rectangulaire par hôte GLB choisi (approximation de la boîte englobante). Disponible seulement si au moins un objet hôte est sélectionné. |
+
+On peut **activer plusieurs types à la fois** (ex. point + mesh). Persistance : `lightStyle` s’il n’y en a qu’un, sinon `lightStyles: [...]`. Le style, la direction et les options ci-dessous se règlent dans la **fenêtre de la lumière** (mode édition : choisir la lumière, puis **Modifier la lumière…** dans sa fiche).
+
+### Modes, objet et émisivité
+
+Une ancre lumière peut :
+
+| Mode | Comment |
+|---|---|
+| **Lumière 3D seule** | Émettre une Point/Spot (défaut). Aucun objet GLB requis. |
+| **Émisivité seule** | Décocher « Émettre une lumière 3D » et choisir une ou plusieurs mailles, les objets brillent, sans Point/Spot. |
+| **Les deux** | Lumière 3D + maille(s) hôte(s) pour l’émisivité. |
+
+- **Objet(s)** : optionnel sauf pour l’émisivité ou le style **forme objet** (alors au moins un). Clic sur le modèle ou arbre d’objets ; **Ctrl+clic** ajoute/retire une maille (clic simple remplace). Tout retirer fait repasser `mesh` en `point`.
+- **Émisivité** : lueur sur **chaque** hôte choisi avec la **même couleur** que la lumière 3D ; curseur d’intensité ; liaison optionnelle à la luminosité HA.
+- **Forme objet (`mesh`)** : éclaire via un rectangle calé sur la boîte englobante de chaque hôte (pas une vraie lumière maillée). Combinable avec point/spot/beam.
+- **Ancrer la lumière à l’objet** : si des hôtes sont choisis et qu’un type positionnel (point/spot/beam) est actif, ces lumières passent au **centre AABB combiné**. Les rectangles mesh restent sur chaque hôte.
+- **Couleur / intensité** : partagées par **tous** les casts sélectionnés et l’émisivité ; HA prime, sinon secours du panneau.
+
+
+### Interactions
+
+- **Clic court** → Toggle l'entité (allumer/éteindre la lumière, ouvrir/fermer le volet…)
+- **Appui long** → Ouvre le panneau `more-info` de Home Assistant pour l'entité
+
+### Visibilité conditionnelle
+
+Chaque ancre peut être masquée/affichée selon l'état d'une entité :
+
+> *Exemple : n'afficher le capteur de température de la chambre que lorsque la porte est ouverte.*
+
+Configurez cela dans les propriétés de l'ancre → **Visible si** dans l'éditeur.
+
+### Options avancées
+
+| Option | Description |
+|---|---|
+| `label` | Texte personnalisé affiché sur l'étiquette |
+| `icon` | Icône MDI personnalisée (ex: `mdi:thermometer`) |
+| `precision` | Nombre de décimales pour les capteurs (ex: `0` → "18", `1` → "17.6") |
+| `lightIntensity` | Multiplicateur d'intensité lumineuse (défaut: 1) |
+| `castLight` | Émettre une Point/Spot 3D (`false` = émisivité seule) |
+| `lightStyle` | Type de cast unique (`point` / `spot` / `beam` / `mesh`) |
+| `lightStyles` | Plusieurs types de cast à la fois (si plus d’un) |
+| `lightMesh` / `lightMeshIndex` / `lightTriangle` | Hôte GLB unique (historique / un seul) |
+| `lightMeshes` | Plusieurs hôtes GLB `{ mesh, meshIndex?, triangle? }[]` (si plus d’un) |
+| `emissiveLevel` | Intensité émissive max sur le(s) hôte(s) (défaut 0.8) |
+| `linkEmissiveBrightness` | Émisivité × luminosité HA (défaut true s’il y a un hôte) |
+| `attachLightToObject` | Placer la lumière 3D au centre AABB combiné des hôtes |
+| `lightColor` / `lightColorTemp` | Couleur de secours (`#rrggbb`) / mireds pour la Point/Spot et l’émisivité |
+
+---
+
+## Ouvrants
+
+<p align="center">
+  <img src="../assets/openings.gif" alt="Une porte qui s'ouvre avec son entité, poignée et couleur d'état comprises" width="600" />
+</p>
+
+Les ouvrants sont des pièces de votre modèle (portes, fenêtres, volets, porte de lave-vaisselle ou de four, fauteuil inclinable) qui bougent quand une entité Home Assistant s'ouvre ou se ferme. Le fichier du modèle n'est pas modifié : pivoter, coulisser et se dérouler détachent la pièce dans la carte ; **Joue les animations du modèle** pose les nœuds déjà enregistrés dans le GLB.
+
+> Plan importé depuis Sweet Home 3D ? Portes et fenêtres sont ajoutées pour vous, toutes réglées : voir [Portes et fenêtres repérées pour vous](#portes-et-fenêtres-repérées-pour-vous). Les étapes ci-dessous servent pour tout le reste.
+
+### Ajouter un ouvrant
+
+1. Mode édition → onglet **Ouvrants** → **+ Ouvrant**
+2. Cliquez la porte, la fenêtre ou le volet sur le modèle
+3. Réglez-le dans le panneau qui s'ouvre, vérifiez le mouvement avec **Aperçu**, puis enregistrez la scène
+
+Le panneau est une fenêtre flottante : déplacez-la par son en-tête pour voir le modèle derrière, et continuez à tourner autour pendant qu'elle est ouverte. **Annuler** (ou **Échap**) abandonne vos changements, ou supprime un ouvrant tout juste créé. Ouvrir un autre ouvrant conserve les réglages du précédent ; quitter le mode édition ferme le panneau.
+
+### Choisir ce qui bouge
+
+L'arborescence **Objet** liste les objets et groupes du modèle, comme l'outliner de Blender. Survolez une ligne pour la surligner dans la vue, cliquez-la pour en faire la pièce mobile : un groupe bouge avec tout son contenu. La pièce cliquée est révélée et sélectionnée à l'ouverture du panneau ; **Pièce cliquée** revient au seul morceau de maille. Le filtre recherche par nom.
+
+### Options
+
+| Option | Description |
+|---|---|
+| **Nom** | Affiché dans la liste des ouvrants et l'en-tête du panneau |
+| **Entité** | Pilote le mouvement. Les entités `cover` suivent `current_position` ; `cover`, `valve`, `lock`, `binary_sensor`, `switch`, `light`, `input_boolean`, `fan` et `group` sont lues comme ouvert/fermé |
+| **Mouvement** | **Pivote** (porte, fenêtre à battant), **Coulisse** (volet roulant, baie), **Se déroule** (store banne, store, rideau — voir plus bas) ou **Joue les animations du modèle** (pistes NLA de Blender dans le GLB — voir plus bas) |
+| **Rotation** | Battants uniquement. **Verticale** pour une porte, **Horizontale** pour un lave-vaisselle, un four ou une fenêtre à soufflet |
+| **Côté des gonds** | L'arête qui porte les gonds : un côté / l'autre, ou **En bas** / **En haut** pour une rotation horizontale |
+| **S'ouvre vers** | Le côté du mur vers lequel pivote le vantail. Le modèle ne sait pas où est l'intérieur : vérifiez à l'aperçu et inversez si besoin |
+| **Angle d'ouverture** / **Se retire vers** / **Course** | Amplitude et sens du mouvement |
+| **Durée** | Durée de l'animation, en secondes |
+| **Inverser** | Pour les entités dont « ouvert » dans Home Assistant signifie fermé à l'écran |
+| **Couleur fermé** / **Couleur ouvert** | Teinte facultative de l'objet dans chaque état (**Aucune** pour désactiver). Entre les deux, la teinte suit le mouvement |
+
+Pour supprimer un ouvrant, cliquez son bouton de suppression dans la liste, puis cliquez à nouveau dans les 3 secondes pour confirmer.
+
+### Stores bannes, stores et rideaux (Se déroule)
+
+Un ouvrant **Se déroule** replie l'objet choisi le long d'une direction, vers une arête fixe. Le modèle le montre **grand ouvert** ; en se fermant, il se replie vers l'arête fixe. Pour un store banne, choisissez seulement la **toile** dans l'arborescence « Objet », pas le coffre ni les bras : ce sont des objets séparés, ils ne sont donc pas écrasés.
+
+En passant à **Se déroule**, Houscape mesure la toile : son arête horizontale le long du mur, la direction qui descend en s'en éloignant, et son inclinaison. Tout reste modifiable, et **↺ Détecter à nouveau** revient aux valeurs mesurées.
+
+| Option | Description |
+|---|---|
+| **Se replie le long de** | **Sortant du mur** (store banne, incliné selon l'inclinaison), **La verticale** (store, rideau qui se relève) ou **Le mur** (rideau qui se tire de côté). L'axe détecté est signalé |
+| **Inclinaison sous l'horizontale** | Axe sortant du mur uniquement. 0° sort à plat, 90° descend le long du mur. Par défaut, celle de la toile |
+| **Arête fixe** | L'arête qui ne bouge pas : contre le mur / en haut / à un bout par défaut, ou l'arête opposée |
+| **Taille ouvert** / **Taille fermé** | Taille le long de l'axe à 100 % et à 0 %, par rapport au modèle. Par défaut 100 % et 0 %. Quelques pour cent une fois fermé laissent voir un liseré de toile |
+| **Fermé à** | **0 %** pour un `cover` standard (100 % = grand ouvert). **100 %** pour un volet qui rapporte l'inverse. C'est le même réglage que **Inverser** |
+| **Suit l'arête mobile** | Objets qui se déplacent avec l'arête libre sans être étirés, comme la barre de charge d'un store. Ceux qui touchent cette arête sont suggérés d'office (★). Ils sont surlignés en bleu dans la vue et prennent aussi la teinte d'état |
+
+Un `cover` qui rapporte `current_position` s'affiche à cette position. Un `cover` sans position s'affiche grand ouvert ou fermé.
+
+> **Exemple** : dans un modèle où chaque store est fait de `motor` (coffre), `tela` (toile) et `extremo` (barre de charge, enfant de la toile), choisissez `tela` puis **Se déroule**. L'inclinaison est détectée et `extremo` est proposé comme suiveur. Seule la toile se replie : la barre remonte jusqu'au coffre.
+
+> **Astuce** : le gond est placé sur l'arête de la boîte englobante de la pièce, pas sur l'origine de l'objet dans Blender.
+
+### Animations du modèle (NLA de Blender)
+
+Si le GLB contient des animations glTF (option **NLA Tracks** à l'export Blender), un ouvrant peut **jouer ces animations** au lieu de pivoter, coulisser ou se dérouler. La position de l'entité parcourt la piste : 0 % est la première image clé, 100 % la dernière, et 40 % reste à 40 % du chemin — comme un volet. Choisissez une ou plusieurs animations ; elles avancent toutes ensemble.
+
+Ce mouvement ne détache rien : les pistes posent les nœuds qu'elles animent déjà. L'arborescence Objet et les pièces emmenées par l'ouvrant sont masquées ; le surlignage et la teinte prennent le parent commun de ces nœuds (le canapé, pas toute la maison). La durée reprend celle de l'animation pour la jouer à la vitesse de Blender ; vous pouvez encore la changer.
+
+On peut poser plusieurs de ces ouvrants sur le même objet (un `cover` pour l'inclinaison droite, un autre pour la gauche). Un clic ne rouvre un ouvrant que s'il tombe sur un nœud que cet ouvrant anime vraiment — pas le canapé entier.
+
+Si deux ouvrants reçoivent des animations qui bougent le même nœud, c'est le dernier posé à chaque image qui l'emporte. Préférez des ensembles de pistes disjoints.
+
+Exportez depuis Blender avec **Animation → NLA Tracks**. Les actions qui commencent à l'image 1 (et non 0) sont gérées. three.js assainit les noms (`tela.001` → `tela001`).
+
+> **Exemple** : un fauteuil inclinable exporté en `Reclinar_Der`, `Reclinar_Izq`, `Cabezal_Der`, `Cabezal_Izq`. Liez le `cover` de droite à `Reclinar_Der` et `Cabezal_Der` : les deux mécanismes suivent la position de ce volet. Un second ouvrant avec le `cover` de gauche et les deux pistes `*_Izq` laisse le côté droit tranquille.
+
+---
+
+## Effets
+
+Les effets teintent ou montrent / cachent des objets du modèle d'après une entité Home Assistant, sans les déplacer. Ils forment une liste de scène distincte des ouvrants.
+
+### Ajouter un effet
+
+1. Mode édition → onglet **Effets** → **+ Effet**
+2. Cliquez le premier objet sur le modèle (curseur en croix, comme pour les ouvrants). L'arborescence **Objet** permet de choisir un objet ou groupe Blender entier
+3. Optionnel : ajoutez d'autres cibles (ex. tous les radiateurs) avec **+ Cliquer un objet du modèle**, ou **Ctrl+clic** (**⌘+clic** sur Mac) dans l'arborescence **Objet**
+4. Choisissez le type, liez une entité. Tant que le panneau est ouvert, l'effet s'affiche **en direct** sur le modèle ; **Annuler** restaure l'état précédent
+
+| Type | Description |
+|---|---|
+| **Matériau** | Met en évidence le ou les objets quand la condition est vraie (ex. radiateurs tant que le `climate` rapporte `hvac_action: heating`). **Rendu** : **Remplissage** teinte toute la surface (couleur + lueur) ; **Contour** ne dessine que les arêtes colorées |
+| **Visibilité** | Montre le ou les objets quand la condition est vraie, les cache sinon (ex. une silhouette quand un capteur de présence est on). **Inverser** reverse ce sens |
+
+**Visible à travers les murs** dessine l'objet (ou son contour) par-dessus le modèle tant que l'effet est actif (sans test de profondeur), pour le lire derrière un mur, comme le surlignage de l'éditeur.
+
+**Durée** (facultatif) fond l'apparence quand la condition s'allume ou s'éteint (teinte, contour, see-through et opacité de visibilité). Laissez à 0 pour un basculement instantané, le défaut des scènes plus anciennes.
+
+**Attribut** (facultatif) lit un attribut d'entité à la place de l'état, pour un thermostat, indiquez `hvac_action` et sélectionnez `heating` sous **Actif quand**. Laissez **Actif quand** vide pour le repli d'Houscape (on/off selon le type d'entité, ou toute valeur d'attribut hors arrêt). Si une valeur manque dans la liste proposée, saisissez-la sous **Ajouter une valeur** (virgules acceptées) ; les entrées personnalisées sont enregistrées dans `when` comme les puces.
+
+---
+
+## Vues caméra
+
+Les vues caméra vous permettent de sauvegarder des points de vue et de naviguer entre eux avec une animation fluide.
+
+### Utilisation
+
+1. Mode édition → onglet **Camera** (ou cliquez l'icône 📷 dans la barre d'outils)
+2. Positionnez la caméra où vous voulez
+3. Cliquez **Capturer la vue** et donnez un nom
+4. La vue apparaît dans la barre de navigation en bas de la scène
+
+Dans l'onglet Camera vous pouvez **renommer** une vue (✎), la **réordonner** (↑ / ↓), la masquer de la barre ou la supprimer. La barre du bas met en évidence la dernière vue atteinte ; s'il y en a beaucoup, glissez horizontalement pour faire défiler.
+
+<p align="center">
+  <img src="../assets/rules.gif" alt="Navigation entre vues caméra" width="600" />
+</p>
+
+### Vues cachées
+
+Une vue peut être marquée comme **cachée** : elle n'apparaît pas dans la barre de navigation mais reste utilisable par les règles (ex: « voler vers la cuisine quand un mouvement est détecté »).
+
+
+---
+
+## Moteur de règles
+
+Les règles permettent de créer des automatisations visuelles internes à la scène 3D.
+
+### Structure d'une règle
+
+```
+QUAND  [trigger]       →  un changement d'état se produit
+SI     [conditions]    →  toutes les conditions sont vraies (optionnel)
+ALORS  [actions]       →  exécuter une ou plusieurs actions
+```
+
+### Triggers
+
+| Type | Description |
+|---|---|
+| **Changement d'état** | Se déclenche quand l'état d'une entité change. Filtres optionnels `de` et `vers` |
+
+*Exemple : « Quand `binary_sensor.mouvement_salon` passe de `off` à `on` »*
+
+### Conditions
+
+Les conditions filtrent l'exécution (logique **ET** : toutes doivent être vraies).
+
+| Opérateur | Description |
+|---|---|
+| `=` | Égal |
+| `≠` | Différent |
+| `>` `<` `≥` `≤` | Comparaisons numériques |
+| `contient` | Le texte contient la valeur |
+
+Chaque condition peut être **inversée** (mode « Masquer si »).
+
+### Actions
+
+| Action | Description |
+|---|---|
+| **Aller à la vue** | Anime la caméra vers une vue sauvegardée |
+| **Mettre en évidence** | Fait pulser une ancre dans la couleur de votre choix |
+| **Message** | Affiche un court message dans la carte |
+| **Appeler un service** | Appelle un service HA (ex: `light.turn_on`, `notify.mobile`) |
+
+### Exemple concret
+
+> **Règle « Alerte intrusion »**
+> - Trigger : `binary_sensor.porte_entree` passe à `on`
+> - Condition : `alarm_control_panel.maison` = `armed_away`
+> - Actions :
+>   - Aller à la vue « Entrée »
+>   - Mettre en évidence l'ancre `light.entree` en rouge
+>   - Message « Quelqu'un à la porte »
+
+<p align="center">
+  <img src="../assets/rules.gif" alt="Moteur de règles en action" width="600" />
+</p>
+
+---
+
+## Environnement
+
+Houscape peut synchroniser l'éclairage ambiant et les effets météo avec vos entités Home Assistant.
+
+### Soleil
+
+Configurez `sun_entity: sun.sun` pour que la lumière du soleil suive la position réelle.
+
+| Mode | Description |
+|---|---|
+| **Showcase** | Lumière douce et flatteuse, idéale pour la présentation |
+| **Réaliste** | Position solaire fidèle à la réalité, avec prise en compte de l'orientation de la maison |
+
+En mode **réaliste**, configurez `house_orientation` (en degrés) pour aligner le nord du modèle avec le nord réel :
+- `0` = la face avant du modèle pointe vers le nord
+- `90` = la face avant pointe vers l'est
+
+### Météo
+
+Configurez `weather_entity: weather.maison` pour des effets visuels dynamiques :
+
+| État HA | Effet visuel |
+|---|---|
+| Ensoleillé / Nuit claire | Aucun effet |
+| Nuageux | Lumière tamisée, brume légère |
+| Pluie | Particules de pluie |
+| Pluie forte | Pluie dense |
+| Orage | Pluie + éclairs |
+| Neige | Particules de neige |
+| Brouillard | Brouillard dense |
+| Grêle | Particules de grêle |
+| Vent | Effet de vent |
+
+
+<p align="center">
+  <img src="../assets/weather.gif" alt="Effets météo et soleil" width="600" />
+</p>
+
+---
+
+## Rendu et apparence
+
+Tous les paramètres de rendu se configurent dans l'onglet **Config** de l'éditeur.
+
+| Paramètre | Description | Défaut |
+|---|---|---|
+| `shadows` | Active les ombres portées | `false` |
+| `reflections` | Les métaux et les miroirs reflètent une pièce procédurale au lieu de s'afficher en noir. Les autres matériaux ne changent pas. | `false` |
+| `reflection_intensity` | Force avec laquelle ces métaux et ces miroirs reflètent la pièce procédurale. `0` masque le reflet sans désactiver l'option. | `1` |
+| `reflection_metalness` | Métal minimum pour qu'un matériau reçoive le reflet. Plus bas inclut davantage de surfaces. | `0.5` |
+| `reflection_hdri` | URL facultative d'un .hdr équirectangulaire reflété par les métaux et les miroirs. Vide : la pièce procédurale, sans téléchargement. Un fichier 1k dans `/config/www`, en chemin `/local/….hdr`, suffit. | |
+| `exposure` | Luminosité globale (tone mapping) | — |
+| `fog_density` | Densité du brouillard ambiant | `0.018` |
+| `transparent_background` | Fond transparent (laisse voir le dashboard) | `false` |
+| `sky` | Ciel atmosphérique | `false` |
+| `sun_intensity` | Intensité du soleil | `0.8` |
+| `ambient_intensity` | Intensité de la lumière ambiante | `0.7` |
+| `light_occlusion` | Empêche le soleil d'entrer par le toit ouvert | `none` |
+
+### Styles de sol
+
+| Style | Description |
+|---|---|
+| `none` | Pas de sol |
+| `square` | Plan carré |
+| `disc` | Disque circulaire |
+| `infinite` | Plan infini |
+| `podium` | Socle surélevé |
+
+Le sol est configurable en couleur et en échelle via `ground_color` et `ground_scale`.
+
+---
+
+## Raccourcis clavier (mode édition)
+
+| Touche | Action |
+|---|---|
+| **S** | Outil sélection |
+| **G** | Mode grab (déplacement libre) |
+| **X** / **Y** / **Z** | Contraindre le déplacement à un axe |
+| **Ctrl+Z** | Annuler |
+| **Ctrl+Shift+Z** | Rétablir |
+| **Suppr** | Supprimer l'ancre sélectionnée |
+
+---
+
+## Configuration YAML complète
+
+Voici l'ensemble des options disponibles :
+
+```yaml
+type: custom:houscape-card
+scene_id: ma_maison
+model_url: /local/models/maison.glb
+```
+
+> **Note** : La plupart de ces options sont configurables directement depuis l'éditeur visuel. Le YAML n'est nécessaire que pour la configuration initiale (`scene_id` et `model_url`).

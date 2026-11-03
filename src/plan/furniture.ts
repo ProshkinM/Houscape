@@ -1,0 +1,356 @@
+/**
+ * plan/furniture.ts — les meubles posés sur le plan, en 3D et vus de dessus.
+ *
+ * Un modèle n'est téléchargé qu'une fois, puis cloné pour chaque meuble posé.
+ * Il est ramené à un repère commun : à la taille réelle, centré sur son
+ * emprise au sol, posé à hauteur zéro, la face avant tournée vers +z (le bas
+ * de l'écran sur le plan, avant toute rotation).
+ *
+ * Les couleurs se changent par matière : les modèles du kit nomment les
+ * leurs (`wood`, `carpet` pour le tissu, `metal`…), on remplace la teinte de
+ * celles qu'on propose de régler.
+ */
+
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import type { PlanDoc, PlanItem } from './types';
+import { catalogItem, modelUrl, catalogScale } from './catalog';
+import { buildProcedural } from './procedural';
+
+/**
+ * Les matières qu'on laisse recolorer : les tissus et les bois. Les modèles
+ * les nomment à leur façon (`carpet` chez Kenney, `Couch_Beige` ou `Wood_Dark`
+ * chez Quaternius).
+ */
+export type TintKind = 'fabric' | 'wood';
+export function tintKind(material: string): TintKind | null {
+  if (/^(carpet|couch_|cushin)/i.test(material)) return 'fabric';
+  if (/^wood/i.test(material)) return 'wood';
+  return null;
+}
+
+interface Loaded {
+  scene: THREE.Group;
+  /** Emprise (x, z) et hauteur (y), en mètres. */
+  size: THREE.Vector3;
+  /** Matières recolorables présentes dans ce modèle. */
+  tints: string[];
+}
+
+const loader = new GLTFLoader();
+const cache = new Map<string, Promise<Loaded>>();
+const ready = new Map<string, Loaded>();
+
+const urlOf = (model: string) => (catalogItem(model) ? modelUrl(model) : model);
+
+/** Charge (une fois) un modèle du catalogue ou une adresse de modèle importé. */
+export function loadFurniture(model: string): Promise<Loaded> {
+  let p = cache.get(model);
+  if (!p) {
+    const made = buildProcedural(model);
+    const source = made ? Promise.resolve({ scene: made }) : loader.loadAsync(urlOf(model));
+    p = source.then((gltf) => {
+      const scene = gltf.scene;
+      const item = catalogItem(model);
+      if (item && !made) scene.scale.setScalar(catalogScale(item));
+      if (item?.id.startsWith('q_')) {
+        // Les couleurs du pack Quaternius sortent de Blender déjà assombries
+        // pour un affichage linéaire : on les remonte d'un cran, sinon un
+        // canapé beige paraît brun.
+        const done = new Set<THREE.Material>();
+        scene.traverse((o) => {
+          const m = o as THREE.Mesh;
+          if (!m.isMesh) return;
+          for (const mat of [m.material].flat()) {
+            if (done.has(mat)) continue;
+            done.add(mat);
+            (mat as THREE.MeshStandardMaterial).color?.convertLinearToSRGB();
+          }
+        });
+      }
+      else {
+        // Un meuble importé peut être en centimètres (Sweet Home 3D) ou en
+        // millimètres : un canapé de 200 unités n'est pas un canapé de 200 m.
+        scene.updateMatrixWorld(true);
+        const s = new THREE.Box3().setFromObject(scene).getSize(new THREE.Vector3());
+        const big = Math.max(s.x, s.y, s.z);
+        if (big > 2000) scene.scale.multiplyScalar(0.001);
+        else if (big > 20) scene.scale.multiplyScalar(0.01);
+      }
+      scene.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(scene);
+      const c = box.getCenter(new THREE.Vector3());
+      // Centré sur son emprise, posé au sol.
+      scene.position.set(-c.x, -box.min.y, -c.z);
+      const wrap = new THREE.Group();
+      wrap.add(scene);
+      const tints = new Set<string>();
+      wrap.traverse((o) => {
+        const m = o as THREE.Mesh;
+        if (!m.isMesh) return;
+        for (const mat of [m.material].flat()) if (tintKind(mat.name)) tints.add(mat.name);
+      });
+      const out = { scene: wrap, size: box.getSize(new THREE.Vector3()), tints: [...tints] };
+      ready.set(model, out);
+      return out;
+    });
+    // Un échec ne doit pas rester en cache : on réessaiera au prochain essai.
+    p.catch(() => cache.delete(model));
+    cache.set(model, p);
+  }
+  return p;
+}
+
+/** Taille connue d'un modèle déjà chargé (sinon rien). */
+export function furnitureSize(model: string): THREE.Vector3 | null {
+  return ready.get(model)?.size ?? null;
+}
+
+export function furnitureTints(model: string): string[] {
+  return ready.get(model)?.tints ?? [];
+}
+
+/** Taille d'origine d'un modèle, en mètres : largeur, profondeur, hauteur. */
+export function baseSize(model: string): { w: number; d: number; h: number } | null {
+  const s = furnitureSize(model);
+  return s ? { w: s.x, d: s.z, h: s.y } : null;
+}
+
+/** Emprise d'un meuble posé, en mètres : largeur (x local), profondeur, hauteur. */
+export function itemSize(item: PlanItem): { w: number; d: number; h: number } {
+  if (item.size) return { w: item.size[0], d: item.size[1], h: item.size[2] };
+  const s = baseSize(item.model);
+  const k = item.scale ?? 1;
+  return s ? { w: s.w * k, d: s.d * k, h: s.h * k } : { w: 0.5, d: 0.5, h: 0.5 };
+}
+
+/** Le point est-il sur l'emprise de ce meuble (rectangle tourné) ? */
+export function overItem(item: PlanItem, p: { x: number; y: number }, margin = 0): boolean {
+  const { w, d } = itemSize(item);
+  const a = (item.rotation * Math.PI) / 180;
+  const vx = p.x - item.x, vy = p.y - item.y;
+  const lx = vx * Math.cos(a) + vy * Math.sin(a), ly = -vx * Math.sin(a) + vy * Math.cos(a);
+  return Math.abs(lx) <= w / 2 + margin && Math.abs(ly) <= d / 2 + margin;
+}
+
+/** Un tapis : on marche dessus, on n'y adosse rien. */
+export const isFlat = (item: PlanItem) => itemSize(item).h < 0.05;
+
+/**
+ * Le meuble sur lequel un objet est posé, s'il y en a un : le plus haut de
+ * ceux sous son centre, à condition d'être plus grand que lui (vu de dessus).
+ * Une plante lâchée sur le meuble télé monte dessus au lieu de le traverser,
+ * même devant la télé : un objet « à poser » ne porte rien ;
+ * une chaise contre une table, dont le centre reste à côté, reste au sol ; un
+ * tapis, plus grand que le canapé, ne monte jamais dessus.
+ */
+export function supportOf(plan: PlanDoc, item: PlanItem): PlanItem | null {
+  const c = catalogItem(item.model);
+  if (c?.wall !== undefined || c?.ceiling) return null;
+  const { w, d } = itemSize(item);
+  const area = w * d;
+  let best: PlanItem | null = null;
+  for (const other of plan.items ?? []) {
+    if (other.id === item.id || !overItem(other, item)) continue;
+    const oc = catalogItem(other.model);
+    // Un objet « à poser » (télé, lampe, écran) ne porte rien : une plante
+    // lâchée devant la télé va sur le meuble, pas sur l'écran.
+    if (oc?.wall !== undefined || oc?.ceiling || (oc?.top && !oc.surface)) continue;
+    const s = itemSize(other);
+    // Un objet « à poser » va toujours sur un support du catalogue ; sinon le
+    // plus petit se pose sur le plus grand.
+    const fits = (c?.top && oc?.surface) || s.w * s.d > area;
+    if (!fits) continue;
+    if (!best || itemTop(plan, other) > itemTop(plan, best)) best = other;
+  }
+  return best;
+}
+
+/** Hauteur du dessus d'un meuble. */
+export function itemTop(plan: PlanDoc, item: PlanItem, depth = 0): number {
+  return itemElevation(plan, item, depth) + itemSize(item).h;
+}
+
+/**
+ * Hauteur du bas d'un meuble : celle choisie, sinon au mur ou sous le
+ * plafond selon le catalogue, sur le meuble du dessous pour un objet posé
+ * (une lampe sur une table de chevet), et au sol pour le reste.
+ */
+export function itemElevation(plan: PlanDoc, item: PlanItem, depth = 0): number {
+  if (item.elevation !== undefined) return item.elevation;
+  const c = catalogItem(item.model);
+  if (c?.ceiling) return Math.max(0, plan.wallHeight - itemSize(item).h);
+  if (c?.wall !== undefined) return c.wall;
+  // Garde-fou : des objets empilés en boucle ne doivent pas tourner sans fin.
+  const under = depth < 4 ? supportOf(plan, item) : null;
+  return under ? itemTop(plan, under, depth + 1) : 0;
+}
+
+/** Une copie du modèle pour un meuble posé, aux couleurs choisies. */
+function instance(loaded: Loaded, item: PlanItem): THREE.Object3D {
+  const obj = loaded.scene.clone(true);
+  const colors = item.colors ?? {};
+  if (Object.keys(colors).length) {
+    const swapped = new Map<THREE.Material, THREE.Material>();
+    obj.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (!m.isMesh) return;
+      const swap = (mat: THREE.Material) => {
+        const color = colors[mat.name];
+        if (!color) return mat;
+        let copy = swapped.get(mat);
+        if (!copy) {
+          copy = mat.clone();
+          (copy as THREE.MeshStandardMaterial).color?.set(color);
+          swapped.set(mat, copy);
+        }
+        return copy;
+      };
+      m.material = Array.isArray(m.material) ? m.material.map(swap) : swap(m.material);
+    });
+  }
+  return obj;
+}
+
+/** Préfixe des meubles dans la scène : `plan_item_<id>`. */
+export const ITEM_PREFIX = 'plan_item_';
+
+/**
+ * Pose les meubles du plan dans `root` (le groupe de la maison). Ceux dont le
+ * modèle n'est pas encore là arrivent dès qu'il est chargé ; `onReady` est
+ * appelé une fois tout posé, pour un nouveau rendu.
+ */
+export async function placeFurniture(plan: PlanDoc, root: THREE.Object3D, onReady?: () => void): Promise<void> {
+  const items = plan.items ?? [];
+  const group = new THREE.Group();
+  group.name = 'plan_items';
+  root.add(group);
+  await Promise.all(items.map(async (item) => {
+    let loaded: Loaded;
+    try {
+      loaded = await loadFurniture(item.model);
+    } catch (err) {
+      console.warn('[Houscape] furniture not found:', item.model, err);
+      return;
+    }
+    // Le plan a pu être reconstruit entre-temps.
+    if (!group.parent) return;
+    const obj = instance(loaded, item);
+    const holder = new THREE.Group();
+    holder.name = `${ITEM_PREFIX}${item.id}`;
+    holder.position.set(item.x, itemElevation(plan, item), item.y);
+    holder.rotation.y = -THREE.MathUtils.degToRad(item.rotation);
+    // Taille voulue, axe par axe : on étire le modèle d'origine.
+    const want = itemSize(item);
+    holder.scale.set(want.w / loaded.size.x, want.h / loaded.size.y, want.d / loaded.size.z);
+    holder.userData.houscapeItem = item.id;
+    const lamp = !!catalogItem(item.model)?.light;
+    obj.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (!m.isMesh) return;
+      const mats = [m.material].flat();
+      // Une lampe ne fait pas d'ombre : sa lumière part de l'intérieur de
+      // l'abat-jour, qui la boucherait et ne laisserait qu'une flaque au sol.
+      m.castShadow = !lamp && !mats.some((x) => x.transparent || x.name === 'glass');
+      m.receiveShadow = true;
+    });
+    holder.add(obj);
+    group.add(holder);
+  }));
+  onReady?.();
+}
+
+/** Où se trouve l'ampoule d'une lampe posée, dans le repère du plan (x, hauteur, y). */
+export function bulbPosition(plan: PlanDoc, item: PlanItem): [number, number, number] {
+  const { h } = itemSize(item);
+  const c = catalogItem(item.model);
+  const base = itemElevation(plan, item);
+  // Le haut de l'abat-jour pour une lampe posée, le bas pour une suspension.
+  const y = c?.ceiling ? base + h * 0.2 : base + h * 0.85;
+  return [item.x, y, item.y];
+}
+
+// ── Vue de dessus, pour le plan 2D ─────────────────────────────────────────
+
+let topRenderer: THREE.WebGLRenderer | null = null;
+const topCache = new Map<string, string>();
+
+function renderer(): THREE.WebGLRenderer | null {
+  if (topRenderer) return topRenderer;
+  try {
+    topRenderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, preserveDrawingBuffer: true });
+  } catch {
+    return null;
+  }
+  topRenderer.setClearColor(0x000000, 0);
+  topRenderer.outputColorSpace = THREE.SRGBColorSpace;
+  return topRenderer;
+}
+
+const isoCache = new Map<string, Promise<string | null>>();
+
+/**
+ * Une vignette de catalogue : le meuble vu de trois quarts, comme celles du
+ * kit Kenney. Rendue une fois par modèle, pour ceux qui n'en ont pas.
+ */
+export function isoView(model: string): Promise<string | null> {
+  let p = isoCache.get(model);
+  if (!p) {
+    p = loadFurniture(model).then((loaded) => {
+      const r = typeof document === 'undefined' ? null : renderer();
+      if (!r) return null;
+      r.setSize(128, 128, false);
+      const scene = new THREE.Scene();
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8a8a, 2.2));
+      const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+      sun.position.set(2, 4, 3);
+      scene.add(sun);
+      scene.add(loaded.scene.clone(true));
+      const { x: w, y: h, z: d } = loaded.size;
+      const radius = Math.max(Math.hypot(w, h, d) / 2, 0.05);
+      const cam = new THREE.OrthographicCamera(-radius, radius, radius, -radius, 0.01, radius * 20);
+      cam.position.set(radius * 3, h / 2 + radius * 2.4, radius * 3.4);
+      cam.lookAt(0, h / 2, 0);
+      r.render(scene, cam);
+      return r.domElement.toDataURL('image/png');
+    }).catch(() => null);
+    isoCache.set(model, p);
+  }
+  return p;
+}
+
+/**
+ * L'image d'un meuble vu d'au-dessus, à mettre sur le plan. Rendue une fois
+ * par modèle et par jeu de couleurs.
+ */
+export async function topView(item: PlanItem): Promise<string | null> {
+  const key = `${item.model}|${JSON.stringify(item.colors ?? {})}`;
+  const hit = topCache.get(key);
+  if (hit) return hit;
+  let loaded: Loaded;
+  try {
+    loaded = await loadFurniture(item.model);
+  } catch {
+    return null;
+  }
+  if (typeof document === 'undefined' || !renderer()) return null;
+  const { x: w, z: d, y: h } = loaded.size;
+  const px = 256;
+  const k = px / Math.max(w, d);
+  topRenderer!.setSize(Math.max(8, Math.round(w * k)), Math.max(8, Math.round(d * k)), false);
+  const scene = new THREE.Scene();
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8a8a, 2.2));
+  const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+  sun.position.set(-1, 3, -2);
+  scene.add(sun);
+  scene.add(instance(loaded, item));
+  const cam = new THREE.OrthographicCamera(-w / 2, w / 2, d / 2, -d / 2, 0.01, h + 10);
+  // Vue de dessus, l'avant du meuble en bas de l'image.
+  cam.position.set(0, h + 5, 0);
+  cam.up.set(0, 0, -1);
+  cam.lookAt(0, 0, 0);
+  topRenderer!.render(scene, cam);
+  const url = topRenderer!.domElement.toDataURL('image/png');
+  topCache.set(key, url);
+  return url;
+}

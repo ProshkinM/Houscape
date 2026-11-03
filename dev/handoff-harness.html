@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Houscape — relais au serveur de dev</title>
+<pre id="out">…</pre>
+<script type="module">
+  // La carte embarquée doit céder la place au serveur de dev quand il l'a demandé.
+  const q = new URLSearchParams(location.search);
+  if (q.has('dead')) localStorage.setItem('houscape_dev_entry', 'http://127.0.0.1:1/src/dev-entry.ts');
+  else localStorage.setItem('houscape_dev_entry', new URL('/src/dev-entry.ts', location.href).href);
+  sessionStorage.setItem('houscape_dev_reloaded', '1');
+  await import('/custom_components/houscape/frontend/houscape-card.js');
+  await customElements.whenDefined('houscape-card');
+  const fromVite = performance.getEntriesByType('resource').some((e) => e.name.includes('/src/houscape-card.ts'));
+  document.getElementById('out').textContent = `défini : oui, par Vite : ${fromVite}, drapeau : ${localStorage.getItem('houscape_dev_entry')}`;
+  window.__done = true;
+</script>

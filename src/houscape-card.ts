@@ -1,0 +1,6235 @@
+import * as THREE from 'three';
+
+
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
+import { Sky } from 'three/examples/jsm/objects/Sky.js';
+import type { Hass, CardConfig, AnchorEntry, SavedView, EditableAnchor, HouscapeScene, HouscapePart } from './types';
+import { syncLights, stepTransitions } from './lights';
+import {
+  LightEmissiveController, resolveLightHosts, lightHostsCenter, hostIsOpeningPiece,
+} from './light-emissive';
+import { hasLightHost } from './light-fields';
+import {
+  loadGLTF, detectAnchors, buildAnchorsFromEditable, rebuildAnchorLight, lightTargetPos,
+  syncMeshLightPoses,
+} from './model';
+import { modelErrorKey, httpStatus } from './model-errors';
+import { AnchorOverlay, SensorOverlay, ClusterOverlay, LabelOverlay, CameraOverlay, pulseOverlay, placeAt } from './overlay';
+import type { ClusterItem } from './overlay';
+import { AnchorEditor } from './editor';
+import { loadScene, saveScene, listScenes, sceneToEffectiveConfig, buildSceneFromEditor, normalizeViews, emptyScene, sceneUnreachable, forgetSceneFailure } from './scene';
+import { importModel, ImportError } from './import/drop';
+import { unzipSync, strFromU8 } from 'fflate';
+import { readHome, homeToHouse, type Sh3dHome } from './import/sh3d-home';
+import { importSh3dFurniture } from './import/sh3d-furniture';
+import { fitSh3d, makeMover, matchNearest, type Box as FitBox, type Vec3 } from './import/sh3d-migrate';
+import { makeSimplifier } from './import/lighten';
+import { UploadError, type UploadHass } from './import/upload';
+import { attachDropZone, pickFiles, ImportProgress, askOpenings } from './card/import-ui';
+import { assignScene } from './card/lovelace-config';
+import { findLeaves, proposeParts, replaceParts } from './import/sh3d-parts';
+import { setLang, getLang, langFromLocale, t, type StringKey } from './i18n';
+import { demoModelUrl, isPlaceholder, seedDemoAnchors, type DemoAnchorId } from './demo';
+import { openEntityPicker } from './entities/picker';
+import { cachedRegistry, loadRegistry, areaOf, deviceOf, displayName, isTechnical } from './entities/registry';
+import { formatSensor, haPrecision } from './entities/format';
+import { deviceTint } from './ui/device-tint';
+import { matchRooms, placeable, spreadPoints, onePerDevice, normalizeName } from './plan/auto-place';
+import { publishHass } from './entities/live';
+import {
+  disposeEntryLights, castLightsOf, castLightTargetsOf, ensureRectAreaLightLib,
+} from './light-mesh';
+import {
+  listLightHosts, listLightStyles, hasMeshStyle, hasDirectionalStyle,
+} from './light-fields';
+
+/** Clé de traduction du libellé de chaque ancre de démonstration. */
+const DEMO_LABEL: Record<DemoAnchorId, 'demoFloorLamp' | 'demoBedsideLamp' | 'demoKitchenLamp' | 'demoTelevision'> = {
+  floorLamp: 'demoFloorLamp',
+  bedsideLamp: 'demoBedsideLamp',
+  kitchenLamp: 'demoKitchenLamp',
+  television: 'demoTelevision',
+};
+import { qualityFromConfig, qualityKey, profileFor, resolveLevel, detectionLabel } from './quality';
+import { describeEntity, fallbackIcon } from './entities/descriptors';
+import './card-editor';
+import { EnvironmentController } from './card/environment';
+import { SimulationPanel } from './card/simulation';
+import { ViewManager } from './card/view-manager';
+import { EditPanel, editorTabs } from './card/edit-panel';
+import { SceneCardRenderer } from './cards/renderer';
+import { PanelGizmo } from './panels/gizmo';
+import type { SceneCard, SceneCardType } from './cards/types';
+import { PartController, meshOrder, partTargetKey } from './parts-runtime';
+import { EffectController, effectTargetKey } from './effects-runtime';
+import { clipInfos } from './parts-clips';
+import { stampOrder, nodeOrder, resetOrder, rankOf, locatePart } from './model-outline';
+import { PartHighlight, type HighlightSource, type HighlightSlot } from './part-highlight';
+import { modelScale } from './scale';
+import { partIndexOf, partFrame, guessPart, verticalAxis } from './parts';
+import { separateCoplanarSlabs } from './coplanar';
+import { StaticBatch } from './batching';
+import { buildPlan } from './plan/build';
+import { buildHouse, floorGroup, buildRoof, ROOF_NAME, ROOF_COLORS } from './plan/house';
+import { floorViews, floorDoc, withFloorDoc, addFloor, removeFloor, renameFloor, allOpenings, hasWalls, type FloorView } from './plan/floors';
+import { LowWalls, WALL_VIEWS, type WallView } from './plan/low-walls';
+import { syncPlanParts } from './plan/parts';
+import { emptyPlan, type PlanDoc, type OpeningKind } from './plan/types';
+import { PlanEditor } from './plan/editor-ui';
+import { migratePlan } from './plan/migrate';
+import { placeFurniture, bulbPosition } from './plan/furniture';
+import { catalogItem } from './plan/catalog';
+import {
+  assignReflectionMap, createHdriEnvironment, createRoomEnvironment,
+  isReflectionHdr, reflectionHdriUrl, reflectionIntensity, reflectionMetalness, reflectionUpdate,
+} from './room-env';
+import { createUniforms, instrumentMaterials, updateXray, createGhost } from './cutaway';
+import type { CutawayUniforms } from './cutaway';
+import { evalCondition, RuleEngine } from './rules/engine';
+import { CardHud, type DockButton, type HudStatus, type HudRoom, type HudDevice } from './card/hud';
+import { entityIconName } from './ui/entity-icon';
+import { planRooms, roomCamera, roomOfPoint, type RoomView } from './plan/room-views';
+import { STYLES as UI_STYLES, type UiPrefs } from './ui/theme';
+import { icon as uiIcon } from './ui/icons';
+import { Tour, tourSeen, markTourSeen, type TourStep } from './ui/tour';
+import type { HouscapeRule, Action } from './rules/types';
+
+type AnyOverlay = AnchorOverlay | SensorOverlay | LabelOverlay | ClusterOverlay | CameraOverlay;
+
+/**
+ * Largeur de reference d'une vignette, en fraction de la plus grande dimension
+ * du modele. Exprimer une taille en metres ne marche pas : un export en
+ * centimetres donne une maison de 800 unites de large, et la vignette
+ * disparaitrait.
+ *
+ * L'ordre de grandeur se lit ainsi : quand le modele entier tient a l'ecran, la
+ * vignette occupe environ `ratio` fois la hauteur du viewport. A 0.045 elle
+ * faisait 18 px sur une carte de 400 px — toujours sous le plancher, donc de
+ * taille figee.
+ */
+const CAMERA_WIDTH_RATIO = 0.18;
+
+/**
+ * La valeur d'un capteur : décimales réglées sur l'appareil, sinon celles de
+ * Home Assistant (registre), sinon un arrondi lisible ; virgule à la française.
+ */
+function _formatSensorValue(raw: string, precision: number | undefined, entityId: string, hass?: Hass | null): string {
+  return formatSensor(raw, getLang(), precision ?? haPrecision(hass, entityId));
+}
+
+let litGlassMat: THREE.MeshStandardMaterial | null = null;
+/** La vitre d'une pièce éclairée, la nuit : une lueur chaude, partagée par toutes. */
+function litGlass(): THREE.MeshStandardMaterial {
+  return litGlassMat ??= new THREE.MeshStandardMaterial({
+    color: '#ffe2b0', emissive: '#ffb45a', emissiveIntensity: 1.1, roughness: 0.3, transparent: true, opacity: 0.85,
+  });
+}
+
+/**
+ * Estampille de build, lisible depuis la console du navigateur :
+ * `document.querySelector('houscape-card').constructor.HOUSCAPE_BUILD`
+ * Permet de savoir si la page execute bien le code du disque.
+ */
+const HOUSCAPE_BUILD = 'rules-engine-v2';
+
+/**
+ * Scène d'une carte qui n'en désigne aucune : celle que crée l'éditeur visuel.
+ * Absente du serveur, elle s'ouvre sur la maison de démonstration.
+ */
+const DEFAULT_SCENE_ID = 'main';
+
+export class HouscapeCard extends HTMLElement {
+  static readonly HOUSCAPE_BUILD = HOUSCAPE_BUILD;
+
+  private _config: CardConfig | null = null;
+  private _hass: Hass | null = null;
+
+  // Scene backend
+  private _scene: HouscapeScene | null = null;
+  private _sceneLoading = false;
+  /** Une scene a impose sa langue : ne plus suivre celle de Home Assistant. */
+  private _langFromScene = false;
+
+  private renderer: THREE.WebGLRenderer | null = null;
+  private scene: THREE.Scene | null = null;
+  private camera: THREE.PerspectiveCamera | null = null;
+  private controls: OrbitControls | null = null;
+  private canvas: HTMLCanvasElement | null = null;
+  private _hud: HTMLDivElement | null = null;
+  private _hudBar: HTMLDivElement | null = null;
+  private _hudLeft: HTMLDivElement | null = null;
+  private _hudSep: HTMLDivElement | null = null;
+  private _hudRight: HTMLDivElement | null = null;
+  /** Murs qui s'abaissent devant la caméra (plans seulement). */
+  private _lowWalls = new LowWalls();
+  private _hudViews: HTMLDivElement | null = null;
+  /** Les modules de la carte (barre d'outils, vues, état) et leur personnalisation. */
+  private _ui: CardHud | null = null;
+  /** Les visites guidées. */
+  private _tour: Tour | null = null;
+  private _uiSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private overlayContainer: HTMLDivElement | null = null;
+
+  private anchors = new Map<string, AnchorEntry>();
+  private overlays = new Map<string, AnyOverlay>();
+  private _clusters = new Map<string, ClusterOverlay>();
+
+  private rafId = 0;
+  private ro: ResizeObserver | null = null;
+  private readonly _onWindowResize = () => { if (this._config?.height === 'fill' || this._fullscreenHost) this._onResize(); };
+  private modelLoaded = false;
+  private _locked = false;
+  private _editMode = false;
+
+  private _dirty = false;
+  private _lastTime = 0;
+  private _lastGroundKey = '';
+  private _lastQualityKey = '';
+
+  // Profil qualité résolu, relu à chaque frame — mis à jour à l'init et à chaud.
+  private _quality = profileFor('auto');
+
+  /**
+   * Les shadow maps sont recalculées à la demande, pas à chaque image :
+   * tourner la caméra ne change aucune ombre.
+   */
+  private _shadowsDirty = true;
+
+  // Rendu suspendu quand la carte est masquée ou hors écran.
+  /** Aperçu de règle en cours : les overlays restent visibles malgré l'édition. */
+  private _previewingRule = false;
+  private _previewTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private _paused = false;
+  private _io: IntersectionObserver | null = null;
+  private _onVisibility: (() => void) | null = null;
+
+  // Réutilisé chaque frame pour la projection des overlays (évite un clone par
+  // ancre et par image).
+  private _projScratch = new THREE.Vector3();
+
+  // Rafraichissement des vignettes de camera. Piloté depuis la boucle de
+  // rendu : celle-ci sort immédiatement quand la carte est hors écran, donc
+  // les téléchargements s'arrêtent avec elle.
+  private _camAccum = 0;
+
+  // Overlay visibility (tap-to-toggle)
+  private _overlaysVisible = true;
+  private _tapStartTime = 0;
+  private _tapStartPos = { x: 0, y: 0 };
+
+  // Controls visibility (hover / touch reveal)
+  private _controlsHideTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Camera animation
+  private _camAnimTo: { pos: THREE.Vector3; target: THREE.Vector3 } | null = null;
+
+  // Moteur de regles : porte lui-meme ses etats precedents, ses minuteries de
+  // duree et ses anti-rebonds.
+  private _ruleEngine = new RuleEngine();
+  /** Calque translucide du mur retiré — voir cutaway.ts. */
+  private _ghost: THREE.Group | null = null;
+
+  /** Uniformes partagés de l'effacement, mis à jour à chaque image. */
+  private _cutaway: CutawayUniforms = createUniforms();
+
+  /** Ouvrants du modèle animés par l'état des entités (portes, volets…). */
+  private _parts = new PartController();
+  /** Teintes pilotées par entité (radiateurs, etc.), sans mouvement. */
+  private _effects = new EffectController();
+  /** Renseigné pendant que l'éditeur attend un clic sur une pièce du modèle. */
+  private _partPickHandler: ((hit: import('./card/edit-panel').PickedPart) => void) | null = null;
+  /** Mode du pick partagé : ouvrant vs hôte d'une ancre lumière. */
+  private _partPickMode: 'part' | 'lightHost' = 'part';
+  /** Émisivité des meshes hôtes des ancres lumière. */
+  private _lightEmissive = new LightEmissiveController();
+  /** Surlignage de l'arborescence des objets, dans l'éditeur d'ouvrants. */
+  private _highlight = new PartHighlight();
+  /**
+   * Ce que l'éditeur demande de surligner, gardé sous forme de rangs : la
+   * demande survit à un rechargement du modèle et se réapplique ensuite.
+   */
+  private _highlightReq: import('./card/edit-panel').PartHighlightRequest = { hover: null, selected: null };
+
+  // Environment lights
+  private _hemiLight: THREE.HemisphereLight | null = null;
+  private _sunLight: THREE.DirectionalLight | null = null;
+  private _sky: Sky | null = null;
+
+  private _modelBox = new THREE.Box3();
+  /** Plus grande dimension du modele, dans ses propres unites. */
+  private _modelSpan = 1;
+
+
+  // Anchor editor
+  private _editor: AnchorEditor | null = null;
+  private _modelRoot: THREE.Object3D | null = null;
+  private _savePending = false;  // true while a callWS is in flight
+  private _importing = false;
+  private _backendRetryAt = 0;
+  /** Objets immobiles fusionnés par matériau, hors édition : voir batching.ts. */
+  private _batch: StaticBatch | null = null;
+  /** Éditeur de plan ouvert, et sauvegarde différée de ses retouches. */
+  private _planEditor: PlanEditor | null = null;
+  private _planSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Cible PMREM des reflets. Nulle tant que l'option n'a pas été activée. */
+  private _reflectionTarget: THREE.WebGLRenderTarget | null = null;
+  /**
+   * Adresse dont cette cible est issue.
+   * `''` : pièce procédurale. `null` : pas encore construite.
+   */
+  private _reflectionBuilt: string | null = null;
+  /** .hdr en cours de chargement. Les curseurs ne doivent pas le relancer. */
+  private _reflectionPending: string | null = null;
+  /** Pour ignorer un chargement devenu caduc (autre URL, carte démontée). */
+  private _reflectionToken = 0;
+  /** Adresse déjà abandonnée : on ne la retélécharge pas à chaque curseur. */
+  private _reflectionFailed: string | null = null;
+  /** Déjà signalée dans la console. Une par adresse, pas une par curseur. */
+  private _reflectionWarned: string | null = null;
+  private _detachDrop: (() => void) | null = null;
+  private _saveQueued = false;   // une modification est arrivee pendant l'envoi
+
+  // Modules
+  private _env: EnvironmentController | null = null;
+  private _sim: SimulationPanel | null = null;
+  private _viewMgr: ViewManager | null = null;
+  private _editPanel: EditPanel | null = null;
+
+  // 3D Scene cards
+  private _cardRenderer: SceneCardRenderer | null = null;
+  private _cardPlacementMode = false;
+  private _cardPlacementType: SceneCardType | null = null;
+
+  // Card selection & grab
+  private _selectedCardId: string | null = null;
+  private _cardGrabMode = false;
+  private _cardGrabOrigin: [number, number, number] | null = null;
+  private _cardGrabPlane = new THREE.Plane();
+  private _cardGrabRaycaster = new THREE.Raycaster();
+  private _cardFocusId: string | null = null;
+
+  // Card gizmo (shared with anchor editing)
+  private _panelGizmo: PanelGizmo | null = null;
+  private _gizmoDragAxis: 'x' | 'y' | 'z' | null = null;
+  private _gizmoDragStartIntersect = new THREE.Vector3();
+  private _gizmoDragCardStartPos = new THREE.Vector3();
+  private _gizmoDragPlane = new THREE.Plane();
+  private _preFocusPos: THREE.Vector3 | null = null;
+  private _preFocusTarget: THREE.Vector3 | null = null;
+  private _lastClickTime = 0;
+  private _lastClickCardId: string | null = null;
+
+  private _requestRender() { this._dirty = true; }
+
+  // ── Persistence ───────────────────────────────────────────────────────
+
+  /**
+   * Clé du point de vue enregistré : par scène et par modèle.
+   *
+   * Elle ne dépendait que du `model_url` du YAML : toutes les cartes et
+   * scènes sans ce réglage partageaient le même point de vue. Passer d'un plan
+   * en centimètres à la démo en mètres replaçait la caméra à des centaines de
+   * mètres.
+   */
+  private get _storageKey() {
+    const model = this._scene?.model_url || this._config?.model_url || 'default';
+    return `houscape-card:${this._getActiveSceneId() ?? ''}:${model}`;
+  }
+
+  /** Un point de vue enregistré qui regarde bien ce modèle, à une distance possible. */
+  private _viewFits(view: SavedView): boolean {
+    if (!this.controls) return false;
+    const target = new THREE.Vector3().fromArray(view.target);
+    const dist = new THREE.Vector3().fromArray(view.pos).distanceTo(target);
+    const box = this._modelBox.clone().expandByScalar(this._modelSpan * 0.5);
+    return box.containsPoint(target)
+      && dist >= this.controls.minDistance * 0.5
+      && dist <= this.controls.maxDistance * 1.5;
+  }
+
+  private _loadView(): SavedView | null {
+    try {
+      const raw = localStorage.getItem(this._storageKey);
+      return raw ? (JSON.parse(raw) as SavedView) : null;
+    } catch { return null; }
+  }
+
+  private _getActiveSceneId(): string | undefined {
+    // Le choix fait depuis le panneau vaut pour cette carte seulement : il est
+    // rangé sous la scène que son YAML désigne. Une clé commune à toutes les
+    // cartes faisait qu'une carte neuve, sans réglage, ouvrait la maison
+    // importée sur une autre carte au lieu de la démo.
+    try {
+      const chosen = localStorage.getItem(this._sceneChoiceKey);
+      if (chosen) return chosen;
+    } catch { /* stockage bloqué */ }
+    return this._config?.scene_id || DEFAULT_SCENE_ID;
+  }
+
+  private get _sceneChoiceKey(): string {
+    return `houscape_scene_id@${this._config?.scene_id ?? ''}`;
+  }
+
+  private _setActiveSceneId(id: string) {
+    try {
+      if (id === (this._config?.scene_id || DEFAULT_SCENE_ID)) localStorage.removeItem(this._sceneChoiceKey);
+      else localStorage.setItem(this._sceneChoiceKey, id);
+    } catch { /* stockage bloqué */ }
+    // Puis dans la carte elle-même, pour qu'elle seule change de scène, sur
+    // tous les appareils. Home Assistant la reconfigure ensuite : le choix
+    // retenu dans le navigateur n'a alors plus lieu d'être.
+    const config = this._config;
+    if (!this._hass || !config || id === config.scene_id) return;
+    const key = this._sceneChoiceKey;
+    assignScene(this._hass, config, id).then((ok) => {
+      if (!ok) return;
+      try { localStorage.removeItem(key); } catch { /* stockage bloqué */ }
+    });
+  }
+
+  private _saveView() {
+    if (!this.camera || !this.controls) return;
+    const view: SavedView = {
+      pos: this.camera.position.toArray() as [number, number, number],
+      target: this.controls.target.toArray() as [number, number, number],
+      locked: this._locked,
+    };
+    localStorage.setItem(this._storageKey, JSON.stringify(view));
+  }
+
+  // ── HA lifecycle ──────────────────────────────────────────────────────
+
+  setConfig(config: CardConfig) {
+    const sceneChanged = config.scene_id !== this._config?.scene_id;
+    this._config = config;
+    if (sceneChanged) {
+      this._scene = null;
+      this._sceneLoading = false;
+    }
+    this._bootstrap();
+  }
+
+  set hass(hass: Hass) {
+    this._hass = hass;
+    this._editor?.setHass(hass);
+    publishHass(hass);
+
+    // Tant qu'aucune scene n'a choisi de langue, on suit celle du frontend :
+    // sans cela un utilisateur francophone lirait l'anglais jusqu'a decouvrir
+    // un reglage qu'il ne soupconne pas. Un choix explicite prime ensuite, et
+    // `_langFromScene` l'empeche d'etre ecrase a la poussee d'etat suivante.
+    if (!this._langFromScene) {
+      setLang(langFromLocale(hass.language ?? hass.locale?.language));
+    }
+
+    // If scene_id is configured and scene hasn't been fetched yet, do it now.
+    // _loadModel() is deferred until scene data is available.
+    const activeSceneId = this._getActiveSceneId();
+    // Intégration injoignable : on réessaie de temps en temps. Après un
+    // redémarrage de Home Assistant, la scène revient sans recharger la page.
+    if (activeSceneId && this._backendDown && !this._sceneLoading && Date.now() - this._backendRetryAt > 10_000) {
+      this._backendRetryAt = Date.now();
+      forgetSceneFailure(activeSceneId);
+      this.overlayContainer?.querySelector('#houscape-backend-down')?.remove();
+      this._scene = null;
+    }
+    if (activeSceneId && !this._scene && !this._sceneLoading) {
+      this._sceneLoading = true;
+      this._fetchAndLoadScene(activeSceneId);
+      return;
+    }
+
+    // Les ouvrants suivent l'état même en édition : voir une porte s'ouvrir est
+    // le seul moyen de vérifier qu'on a choisi le bon côté de gonds.
+    let liveDirty = false;
+    if (this.modelLoaded && this._parts.built && this._parts.applyStates(hass.states)) {
+      liveDirty = true;
+    }
+    if (this.modelLoaded && this._effects.built && this._effects.applyStates(hass.states)) {
+      liveDirty = true;
+    }
+    if (liveDirty) this._requestRender();
+
+    if (this.modelLoaded && !this._editMode) {
+      syncLights(this.anchors, hass, this._effectiveConfig, this._modelSpan);
+      if (this._lightEmissive.sync(this._modelRoot, this.anchors, hass)) this._requestRender();
+      this._updateOverlayStates();
+      // Skip real-entity weather/sun when simulation is overriding
+      if (!this._sim?.isActive) this._env?.updateFromHass(hass);
+      const cards = this._scene?.cards ?? [];
+      if (cards.length > 0) {
+        this._cardRenderer?.updateStates(hass);
+      }
+      this._evaluateRules();
+      this._evaluatePassiveConditions();
+      this._ui?.refreshStatus();
+      this._ui?.refreshRooms();
+      this._updateWindowGlow();
+      this._requestRender();
+    } else if (this.modelLoaded && this._editMode) {
+      // En édition, les lumières / l'émisivité suivent aussi l'état HA.
+      syncLights(this.anchors, hass, this._effectiveConfig, this._modelSpan);
+      if (this._lightEmissive.sync(this._modelRoot, this.anchors, hass)) this._requestRender();
+    }
+  }
+
+  static getStubConfig() {
+    // Une scène propre à chaque nouvelle carte : deux cartes ajoutées depuis
+    // l'interface ne partagent rien, et chacune démarre sur la démo.
+    return { scene_id: `maison_${Date.now().toString(36).slice(-5)}` };
+  }
+
+  static getConfigElement() {
+    return document.createElement('houscape-card-editor');
+  }
+
+  // ── Scene backend ─────────────────────────────────────────────────────
+
+  /** Merged config: scene data overrides YAML config for model_url / anchors / camera_views */
+  private get _effectiveConfig(): CardConfig {
+    const cfg = this._scene ? sceneToEffectiveConfig(this._scene, this._config!) : this._config!;
+    // Sans modèle, ni dans la carte ni dans la scène, la carte montre la maison
+    // de démonstration plutôt qu'un cadre vide : voir demo.ts.
+    if (cfg.model_url?.trim() || this._plan) return cfg;
+    return { ...cfg, model_url: demoModelUrl() };
+  }
+
+  /** Le logement dessiné dans la carte, s'il a au moins une pièce : il fait alors la maison. */
+  private get _plan(): PlanDoc | null {
+    const p = this._planDoc();
+    // Un rez-de-chaussée effacé ne fait pas disparaître les étages.
+    return p && hasWalls(p) ? p : null;
+  }
+
+  /** Le plan de la scène, converti s'il vient d'une version plus ancienne de l'éditeur. */
+  private _planDoc(): PlanDoc | null {
+    const p = this._scene?.plan;
+    if (!p || !this._scene) return null;
+    if (p.version !== 2) this._scene = { ...this._scene, plan: migratePlan(p) ?? undefined };
+    return this._scene.plan ?? null;
+  }
+
+  /**
+   * Point du plan au centre de la scène : fixé une fois pour toutes (voir
+   * PlanDoc.origin), au centre des murs du premier dessin.
+   */
+  private _planOrigin(plan: PlanDoc): { x: number; y: number } {
+    if (!plan.origin) {
+      let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+      for (const n of plan.nodes) {
+        x0 = Math.min(x0, n.x); x1 = Math.max(x1, n.x);
+        y0 = Math.min(y0, n.y); y1 = Math.max(y1, n.y);
+      }
+      plan.origin = { x: Math.round(((x0 + x1) / 2) * 10) / 10, y: Math.round(((y0 + y1) / 2) * 10) / 10 };
+    }
+    return plan.origin;
+  }
+
+  /** Libellé d'un ouvrant créé depuis le plan : « Porte 1 », « Fenêtre 2 · vantail 1 ». */
+  private _planPartLabel = (kind: OpeningKind, n: number, leaf: number, leaves: number) =>
+    `${t(kind === 'door' ? 'sh3dDoor' : kind === 'window' ? 'sh3dWindow' : 'planSlider')} ${n}${leaves > 1 && kind === 'window' ? ` · ${t('sh3dLeaf')} ${leaf}` : ''}`;
+
+  /**
+   * Le plan a changé (éditeur) : la maison se reconstruit sur place.
+   *
+   * Pas de rechargement : la caméra, les ancres et le mode en cours restent
+   * tels quels. Seul le contenu du modèle est remplacé, puis les ouvrants sont
+   * remis d'accord avec le plan (voir plan/parts.ts).
+   */
+  applyPlan(plan: PlanDoc) {
+    if (!this._scene) return;
+    this._scene = { ...this._scene, plan };
+    const root = this._modelRoot;
+    // Premier dessin, ou passage de la démo (ou d'un import) au plan : on charge.
+    if (!root || root.name !== 'houscape_plan' || !hasWalls(plan)) {
+      this._syncPlanPartsAfterLoad = true;
+      void this._loadModel();
+      return;
+    }
+    this._batch?.unmerge();
+    this._highlight.clear();
+    this._parts.dispose(root);
+    // Les meubles partagent la géométrie et les matières de leur modèle en
+    // cache : les jeter forcerait à tout renvoyer au GPU au prochain dessin.
+    // Ils peuvent être dans un étage : on descend sans jamais entrer chez eux.
+    // L'ancienne maison n'est jetée qu'après la première image de la nouvelle :
+    // jeter ses matières d'abord libérait leurs shaders, que la carte graphique
+    // recompilait aussitôt pour la nouvelle maison. Pendant un glissé dans le
+    // plan, cela coûtait des dizaines de millisecondes à chaque mouvement.
+    for (const c of [...root.children]) {
+      root.remove(c);
+      this._stale.push(c);
+    }
+    resetOrder(root);
+    const fresh = buildHouse(plan, this._floorIndex()).root;
+    for (const c of [...fresh.children]) root.add(c);
+    root.updateMatrixWorld(true);
+    this._refreshFloorGroup(root);
+    this._afterPlanBuilt(root);
+    this._placeFurniture(root, plan);
+    // L'ancienne maison part après la prochaine image : il faut qu'elle vienne.
+    this._requestRender();
+  }
+
+  /**
+   * Les meubles arrivent après la maison : leurs modèles se chargent à part.
+   * Une fois posés, les lampes reliées à Home Assistant deviennent des ancres.
+   */
+  private _placeFurniture(root: THREE.Object3D, plan: PlanDoc) {
+    const levels = floorViews(plan).slice(0, this._floorIndex() + 1);
+    if (!levels.some((v) => v.doc.items?.length)) { this._syncLampAnchors(root, plan); return; }
+    for (const v of levels) {
+      if (!v.doc.items?.length) continue;
+      const group = floorGroup(root, plan, v.index);
+      if (!group) continue;
+      void placeFurniture(v.doc, group, () => {
+        if (root !== this._modelRoot) return;
+        root.updateMatrixWorld(true);
+        // Les meubles arrivent après la fusion des objets immobiles : on la
+        // refait pour qu'ils en profitent, sinon chacun coûte ses propres appels.
+        this._batch?.unmerge();
+        this._lowWalls.attachItems(this._activeDoc() ?? plan, this._activeGroup ?? root);
+        this._mergeStatic();
+        this._syncLampAnchors(root, plan);
+        this._requestShadowUpdate();
+        this._requestRender();
+      });
+    }
+  }
+
+  /**
+   * Une ancre de lampe déplacée dans l'éditeur d'ancres a emmené sa lampe :
+   * le plan l'enregistre. La hauteur reste celle de l'ampoule, qui dépend du
+   * meuble ; l'ancre y revient quand la lampe est reposée.
+   */
+  private _lampAnchorsToPlan(editable: Map<string, EditableAnchor>) {
+    const plan = this._scene?.plan;
+    const items = plan?.items;
+    const group = this._modelRoot?.getObjectByName('plan_items');
+    if (!plan || !items?.length || !group) return;
+    let moved = false;
+    const next = items.map((it) => {
+      const ea = [...editable.values()].find((a) => a.planId === `plan_lamp_${it.id}`);
+      if (!ea) return it;
+      const local = group.worldToLocal(ea.position.clone());
+      if (Math.abs(local.x - it.x) < 1e-3 && Math.abs(local.z - it.y) < 1e-3) return it;
+      moved = true;
+      return { ...it, x: Math.round(local.x * 1000) / 1000, y: Math.round(local.z * 1000) / 1000 };
+    });
+    if (!moved) return;
+    const updated = { ...plan, items: next };
+    this.applyPlan(updated);
+    this._schedulePlanSave(0);
+  }
+
+  /**
+   * Une lampe posée sur le plan et reliée à une lumière de Home Assistant est
+   * une ancre comme une autre : elle éclaire la pièce quand l'ampoule est
+   * allumée, et un appui dessus la commande. Le plan reste la source : ces
+   * ancres (`plan_lamp_…`) suivent la lampe quand on la déplace.
+   */
+  private _syncLampAnchors(root: THREE.Object3D, plan: PlanDoc) {
+    if (!this._scene) return;
+    const prefix = 'plan_lamp_';
+    const all = this._scene.anchors ?? [];
+    const before = new Map(all.filter((a) => a.id.startsWith(prefix)).map((a) => [a.id, a]));
+    // Les lampes de tous les niveaux, même ceux qui ne sont pas construits :
+    // leur pastille doit rester (elle est seulement masquée hors de son étage).
+    const mine = floorViews(plan).flatMap((v) => (v.doc.items ?? [])
+      .filter((i) => i.entity && catalogItem(i.model)?.light)
+      .map((i) => ({ i, doc: v.doc, lift: v.elevation })))
+      .map(({ i, doc, lift }) => {
+        const p = root.localToWorld(new THREE.Vector3(...bulbPosition(doc, i)).add(new THREE.Vector3(0, lift, 0)));
+        const prev = before.get(prefix + i.id);
+        return {
+          ...prev,
+          id: prefix + i.id,
+          entity: i.entity!,
+          position: [p.x, p.y, p.z].map((v) => Math.round(v * 1000) / 1000) as [number, number, number],
+        };
+      });
+    const next = [...all.filter((a) => !a.id.startsWith(prefix)), ...mine];
+    if (JSON.stringify(next) === JSON.stringify(all)) return;
+    this._scene = { ...this._scene, anchors: next };
+    this._rebuildAnchors();
+  }
+
+  /** Bornes, ouvrants, ombres et rendu, après une (re)construction du plan. */
+  private _afterPlanBuilt(root: THREE.Object3D) {
+    if (this._scene?.plan) {
+      this._lowWalls.setPlan(this._activeDoc() ?? this._scene.plan, this._activeGroup ?? root);
+      this._lowWalls.instrument(root);
+    }
+    this._modelBox.setFromObject(root);
+    const span = this._modelBox.getSize(new THREE.Vector3());
+    this._modelSpan = Math.max(span.x, span.y, span.z, 1e-3);
+    this._fitSunShadow();
+    this._applyCutaway();
+    if (this._scene?.plan) {
+      this._scene = {
+        ...this._scene,
+        parts: syncPlanParts(root, allOpenings(this._scene.plan), this._scene.parts ?? [], this._planPartLabel),
+      };
+    }
+    this._buildParts();
+    this._updateWindowGlow();
+    // Pendant le dessin, la 3D ne se recadre que si la maison déborde de ce
+    // qu'on voyait : une retouche ne doit pas défaire le point de vue choisi.
+    if (this._planEditor) this._frameIfOutgrown();
+    this._requestShadowUpdate();
+    this._requestRender();
+  }
+
+  /**
+   * Ouvre l'éditeur de plan, en plein écran : le plan à gauche, la 3D à
+   * droite qui suit chaque retouche (ou l'un des deux en grand).
+   *
+   * Dessiner par-dessus la maison de démo repart d'une scène vierge, comme un
+   * import. Par-dessus un modèle importé, le modèle est gardé dans la scène :
+   * effacer toutes les pièces le fait revenir.
+   */
+  openPlanEditor() {
+    const sceneId = this._getActiveSceneId();
+    if (this._planEditor || !this.overlayContainer || !sceneId) return;
+    // Le plein écran est pris avant de quitter l'édition : rien ne clignote.
+    this._setFullscreen('plan', true);
+    if (this._editMode) this._exitEditMode();
+    if (!this._scene) this._scene = emptyScene(sceneId);
+    this.overlayContainer.querySelector('#houscape-demo-banner')?.remove();
+    // Les pièces des entités : chargées d'avance pour nommer les lampes reliées.
+    if (this._hass) void loadRegistry(this._hass).catch(() => {});
+    let fromDemo = this._isDemo;
+    this._tour?.end();
+    this._closeWallMenu();
+    this._ui?.setHidden(true);
+    this._setFullscreen('plan', true);
+    queueMicrotask(() => this._updateRoofVisibility());
+    // L'éditeur dessine un niveau à la fois : son plan, sans la liste des étages.
+    // L'apparence de la maison (façade, toit) vaut pour tous les niveaux : elle
+    // vit sur le rez-de-chaussée, et se règle depuis n'importe quel étage.
+    const HOUSE = ['outside', 'facade', 'plinth', 'roof', 'roofColor'] as const;
+    const levelDoc = (): PlanDoc | null => {
+      const root = this._planDoc();
+      if (!root) return null;
+      const { floors: _f, groundName: _g, ...rest } = floorDoc(root, this._floorIndex());
+      const doc = rest as PlanDoc;
+      const look = doc as unknown as Record<string, unknown>;
+      for (const k of HOUSE) look[k] = root[k];
+      // Un toit réglé avant qu'il ne passe dans le plan.
+      const old = this._effectiveConfig?.rendering;
+      if (!root.roof && old?.roof === 'hip') { doc.roof = 'hip'; doc.roofColor = root.roofColor ?? (old.roof_color === 'tile' ? undefined : old.roof_color); }
+      return doc;
+    };
+    // Le niveau dessiné remis dans le logement.
+    const withLevel = (doc: PlanDoc): PlanDoc => {
+      const root = this._scene?.plan;
+      if (!root || fromDemo) return doc;
+      const k = this._floorIndex();
+      if (k === 0) return withFloorDoc(root, 0, doc);
+      const level = { ...doc } as unknown as Record<string, unknown>;
+      const house: Record<string, unknown> = {};
+      for (const key of HOUSE) { house[key] = level[key]; delete level[key]; }
+      return { ...withFloorDoc(root, k, level as unknown as PlanDoc), ...house };
+    };
+    const saveHouse = (plan: PlanDoc) => {
+      this.applyPlan(plan);
+      this._ui?.refreshFloors();
+      this._schedulePlanSave(400);
+    };
+    // Pendant un glissé, la 3D suit sans suivre chaque mouvement : reconstruire
+    // la maison à chaque déplacement du doigt figeait le dessin, surtout sur
+    // une tablette. Le dernier état demandé est appliqué toutes les 120 ms au
+    // plus, et le regroupement des objets immobiles attend la fin du geste.
+    let pending: PlanDoc | null = null;
+    let previewTimer = 0;
+    let lastPreview = 0;
+    const flushPreview = () => {
+      previewTimer = 0;
+      const doc = pending;
+      pending = null;
+      if (!doc || !this._scene || fromDemo) return;
+      lastPreview = performance.now();
+      this.applyPlan(withLevel(doc));
+    };
+    const stopPreview = () => {
+      pending = null;
+      if (previewTimer) { clearTimeout(previewTimer); previewTimer = 0; }
+      this._planPreviewing = false;
+    };
+    this._planEditor = new PlanEditor({
+      container: this.overlayContainer,
+      plan: levelDoc() ?? emptyPlan(),
+      onChange: (doc) => {
+        stopPreview();
+        if (!this._scene) return;
+        const plan = withLevel(doc);
+        if (fromDemo && hasWalls(plan)) {
+          fromDemo = false;
+          this._scene = { ...this._scene, anchors: [], camera_views: [], parts: [] };
+          try { localStorage.removeItem(this._storageKey); } catch { /* stockage bloqué */ }
+        }
+        this.applyPlan(plan);
+        this._schedulePlanSave(800);
+      },
+      onPreview: (doc) => {
+        if (!this._scene || fromDemo) return;
+        pending = doc;
+        this._planPreviewing = true;
+        if (previewTimer) return;
+        const wait = Math.max(0, 120 - (performance.now() - lastPreview));
+        previewTimer = window.setTimeout(() => requestAnimationFrame(flushPreview), wait);
+      },
+      floors: {
+        list: () => this._floors().map((f) => ({ name: f.name })),
+        active: () => this._floorIndex(),
+        switchTo: (k) => { this._setFloor(k); return levelDoc(); },
+        add: () => {
+          const root = this._planDoc();
+          // Un étage se pose sur une maison : il faut d'abord un rez-de-chaussée.
+          if (!root || !hasWalls(root) || fromDemo) return null;
+          const { plan, index } = addFloor(root, `${t('floorUpper')} ${this._floors().length}`);
+          saveHouse(plan);
+          this._setFloor(index);
+          return levelDoc();
+        },
+        rename: (k, name) => {
+          const root = this._planDoc();
+          if (root) saveHouse(renameFloor(root, k, name));
+        },
+        remove: (k) => {
+          const root = this._planDoc();
+          if (!root || k <= 0) return null;
+          saveHouse(removeFloor(root, k));
+          this._setFloor(k - 1);
+          return levelDoc();
+        },
+        under: () => {
+          const root = this._scene?.plan;
+          const k = this._floorIndex();
+          return root && k > 0 ? floorDoc(root, k - 1) : null;
+        },
+      },
+      // La même liste que pour poser une ancre : par étage et par pièce.
+      pickEntity: (_current, done) => {
+        if (!this._hass || !this.overlayContainer) return;
+        const root = this._scene?.plan;
+        const items = root ? floorViews(root).flatMap((v) => v.doc.items ?? []) : [];
+        const placed = new Set(items.map((i) => i.entity).filter((e): e is string => !!e));
+        openEntityPicker({ container: this.overlayContainer, hass: this._hass, placed, onPick: (entity) => done(entity) });
+      },
+      entityLabel: (entity) => {
+        if (!this._hass) return entity;
+        const reg = cachedRegistry();
+        const area = areaOf(reg, entity)?.name;
+        return `${displayName(reg, this._hass, entity)}${area ? ` · ${area}` : ''}`;
+      },
+      importFurniture: async (files) => (await importModel(this._hass as unknown as UploadHass, files, () => {})).url,
+      importSh3d: () => pickFiles((files) => void this._importModel(files)),
+      navTabs: editorTabs(true),
+      onNavTab: (id) => {
+        // Le plein écran reste : l'éditeur de la maison prend le relais du plan.
+        this._setFullscreen('edit', true);
+        this._planEditor?.close();
+        if (this.modelLoaded && this._modelRoot) this._enterEditMode(id);
+        else this._setFullscreen('edit', false);
+      },
+      onLayout: (covered) => {
+        this._viewShift = covered;
+        this._applyViewShift();
+        if (this._plan && !this._framedBox) this._frameEditor();
+      },
+      onClose: () => {
+        stopPreview();
+        this._planEditor = null;
+        this._updateRoofVisibility();
+        this._framedBox = null;
+        this._viewShift = 0;
+        this._ui?.setHidden(false);
+        this._setFullscreen('plan', false);
+        this._applyViewShift();
+        if (this._plan) this._frameModel();
+        this._schedulePlanSave(0);
+        if (this._isDemo) this._showDemoBanner();
+      },
+    });
+  }
+
+  /** Ce que montrait la 3D au dernier cadrage pendant l'édition. */
+  private _framedBox: THREE.Box3 | null = null;
+
+  private _frameEditor() {
+    this._frameModel();
+    this._framedBox = this._modelBox.clone();
+  }
+
+  /** Recadre seulement si la maison est sortie de ce qu'on cadrait (avec un peu de marge). */
+  private _frameIfOutgrown() {
+    if (!this._plan) return;
+    const seen = this._framedBox?.clone().expandByScalar(0.5);
+    if (!seen || !seen.containsBox(this._modelBox)) this._frameEditor();
+  }
+
+  /**
+   * La carte passe en plein écran le temps de dessiner : elle est sortie du
+   * tableau de bord et posée par-dessus la page, une place vide gardant sa
+   * hauteur. Le rendu 3D (le même canevas) la suit sans rien recréer.
+   */
+  private _fullscreenHost: HTMLDivElement | null = null;
+  private _fullscreenSpot: HTMLDivElement | null = null;
+
+  private get _haCard(): HTMLElement | null {
+    return (this._fullscreenHost?.querySelector('ha-card') ?? this.querySelector('ha-card')) as HTMLElement | null;
+  }
+
+  /** Ce qui demande le plein écran : il dure tant qu'il reste une raison. */
+  private _fsReasons = new Set<string>();
+
+  private _setFullscreen(reason: string, on: boolean) {
+    if (on) this._fsReasons.add(reason); else this._fsReasons.delete(reason);
+    if (this._fsReasons.size) this._enterFullscreen(); else this._exitFullscreen();
+    if (this._fsReasons.has('user')) window.addEventListener('keydown', this._onFullscreenKey, true);
+    else window.removeEventListener('keydown', this._onFullscreenKey, true);
+    this._ui?.refreshDock();
+  }
+
+  /** Échap quitte le plein écran demandé par l'utilisateur, hors édition. */
+  private _onFullscreenKey = (e: KeyboardEvent) => {
+    if (e.key !== 'Escape' || this._editMode || this._planEditor || this._tour?.active || this._ui?.customizing || this._wallMenu) return;
+    this._setFullscreen('user', false);
+  };
+
+  private _enterFullscreen() {
+    const card = this._haCard;
+    if (!card || this._fullscreenHost) return;
+    const spot = document.createElement('div');
+    spot.style.height = `${card.offsetHeight}px`;
+    card.replaceWith(spot);
+    const host = document.createElement('div');
+    host.style.cssText = 'position:fixed;inset:0;z-index:9000;background:#050a14;';
+    host.append(card);
+    document.body.append(host);
+    card.style.setProperty('--ha-card-border-radius', '0');
+    card.style.borderRadius = '0';
+    this._fullscreenHost = host;
+    this._fullscreenSpot = spot;
+    this._onResize();
+  }
+
+  private _exitFullscreen() {
+    const card = this._haCard;
+    const host = this._fullscreenHost, spot = this._fullscreenSpot;
+    this._fullscreenHost = null;
+    this._fullscreenSpot = null;
+    if (!card || !host || !spot) return;
+    card.style.setProperty('--ha-card-border-radius', '12px');
+    card.style.borderRadius = '';
+    spot.replaceWith(card);
+    host.remove();
+    this._onResize();
+  }
+
+  private _schedulePlanSave(delay: number) {
+    if (this._planSaveTimer) clearTimeout(this._planSaveTimer);
+    this._planSaveTimer = setTimeout(() => {
+      this._planSaveTimer = null;
+      const sceneId = this._getActiveSceneId();
+      if (!sceneId || !this._hass || !this._scene) return;
+      saveScene(this._hass, sceneId, this._scene)
+        .catch(() => this._showToast(t('toastSceneSaveError'), true));
+    }, delay);
+  }
+
+  /** Après un chargement déclenché par l'éditeur : accorder les ouvrants au plan. */
+  private _syncPlanPartsAfterLoad = false;
+
+  /** La carte montre-t-elle la maison de démonstration ? */
+  private get _isDemo(): boolean {
+    return !this._effectiveModelUrl() && !this._plan && !this._backendDown;
+  }
+
+  /** Le modèle configuré, scène et YAML confondus, sans le repli de la démo. */
+  private _effectiveModelUrl(): string {
+    const cfg = this._scene ? sceneToEffectiveConfig(this._scene, this._config!) : this._config;
+    return cfg?.model_url?.trim() ?? '';
+  }
+
+  /** L'intégration n'a pas pu lire la scène active : voir `sceneUnreachable`. */
+  private get _backendDown(): boolean {
+    const id = this._getActiveSceneId();
+    return !!id && sceneUnreachable(id);
+  }
+
+  private _fetchAndLoadScene(sceneId: string) {
+    loadScene(this._hass!, sceneId)
+      .then((scene) => {
+        this._scene = scene;
+        this._sceneLoading = false;
+        if (this._isDemo) {
+          const seeded = seedDemoAnchors(scene.anchors, (id) => t(DEMO_LABEL[id]));
+          if (seeded.length) this._scene = { ...scene, anchors: seeded };
+        }
+        if (scene.settings?.language) {
+          this._langFromScene = true;
+          setLang(scene.settings.language);
+        }
+        this._ui?.setPrefs(this._scene.settings?.ui);
+        this._loadModel();
+      })
+      .catch((err) => {
+        console.warn('[Houscape] Scene load failed:', err);
+        this._sceneLoading = false;
+        // Fallback: load from Lovelace config if model_url is present
+        if (this._config?.model_url) this._loadModel();
+      });
+  }
+
+  /**
+   * Enregistre la scene.
+   *
+   * Une sauvegarde arrivant pendant qu'une autre est en vol etait auparavant
+   * abandonnee, ce qui perdait silencieusement la derniere modification — et le
+   * toast de la sauvegarde precedente laissait croire au succes. On memorise
+   * desormais la demande et on rejoue un tour, en reconstruisant la scene a
+   * chaque passage pour toujours ecrire l'etat le plus recent.
+   */
+  async _saveScene() {
+    const sceneId = this._getActiveSceneId();
+    if (!sceneId || !this._hass || !this._editor) return;
+
+    if (this._savePending) { this._saveQueued = true; return; }
+    this._savePending = true;
+
+    try {
+      do {
+        this._saveQueued = false;
+
+        const sceneData = buildSceneFromEditor(
+          sceneId,
+          this._editor.anchors as Map<string, EditableAnchor>,
+          this._scene,
+          this._config!,
+        );
+        // Preserve scene settings (env, rendering, language configured from Config tab)
+        sceneData.settings = this._scene?.settings;
+
+        await saveScene(this._hass, sceneId, sceneData);
+        this._scene = sceneData;
+      } while (this._saveQueued);
+
+      this._showToast(t('toastSceneSaved'));
+    } catch (err) {
+      console.error('[Houscape] Save failed:', err);
+      this._showToast(t('toastSceneSaveError'), true);
+    } finally {
+      this._savePending = false;
+      this._saveQueued = false;
+    }
+  }
+
+  private _showToast(message: string, isError = false) {
+    const toast = document.createElement('div');
+    toast.textContent = message;
+    toast.className = 'ow-toast';
+    toast.setAttribute('role', 'status');
+    toast.style.background = isError ? 'rgba(220,38,38,0.92)' : 'rgba(22,163,74,0.92)';
+    this.overlayContainer?.appendChild(toast);
+    setTimeout(() => { toast.style.opacity = '0'; }, 2000);
+    setTimeout(() => toast.remove(), 2400);
+  }
+
+  // ── Init ──────────────────────────────────────────────────────────────
+
+  private _bootstrap() {
+    if (this.renderer) this._teardown();
+
+    const transparentBg = this._config?.rendering?.transparent_background === true;
+
+    const card = document.createElement('ha-card');
+    card.style.cssText = [
+      'overflow:hidden',
+      'position:relative',
+      'display:block',
+      transparentBg ? 'background:transparent' : 'background:#050a14',
+      transparentBg ? '--ha-card-background:transparent' : '--ha-card-background:#050a14',
+      '--ha-card-border-radius:12px',
+      'padding:0',
+    ].join(';');
+    this.innerHTML = '';
+    this.appendChild(card);
+
+    this.canvas = document.createElement('canvas');
+    this.canvas.style.cssText = 'display:block;width:100%;height:100%;';
+    card.appendChild(this.canvas);
+
+    this.overlayContainer = document.createElement('div');
+    this.overlayContainer.style.cssText =
+      'position:absolute;inset:0;pointer-events:none;overflow:hidden;';
+    card.appendChild(this.overlayContainer);
+
+    // La feuille de styles commune : modules, menus, panneaux, éditeur.
+    const uiStyle = document.createElement('style');
+    uiStyle.textContent = UI_STYLES;
+    card.appendChild(uiStyle);
+
+    this._detachDrop = attachDropZone(
+      card,
+      this.overlayContainer,
+      () => this._canImport(),
+      (source) => this._importModel(source),
+    );
+
+    // Inject custom CSS if configured
+    if (this._config?.custom_css) {
+      const styleEl = document.createElement('style');
+      styleEl.id = 'houscape-custom-css';
+      styleEl.textContent = this._config.custom_css;
+      card.appendChild(styleEl);
+    }
+
+    // ── Barre de l'éditeur d'ancres ───────────────────────────────────────
+    // Hors édition, ce sont les modules de `CardHud` qui s'affichent.
+
+    // Hud: bottom-right corner, holds lock + pencil in normal mode.
+    // In edit mode, repositioned to center and bar glassmorphism is restored.
+    const hud = document.createElement('div');
+    hud.style.cssText = [
+      'position:absolute', 'bottom:12px', 'right:12px',
+      'z-index:10', 'display:none',
+      'flex-direction:column', 'align-items:flex-end', 'gap:6px',
+      'opacity:0', 'transition:opacity .25s ease',
+      'pointer-events:none',
+    ].join(';');
+    this._hud = hud;
+    card.appendChild(hud);
+
+    // Bar — invisible in normal mode, glassmorphism restored in edit mode
+    const bar = document.createElement('div');
+    bar.style.cssText = [
+      'display:flex', 'align-items:center',
+      'border-radius:20px',
+      'padding:5px 8px', 'gap:2px',
+      'pointer-events:auto',
+      'white-space:nowrap',
+    ].join(';');
+    this._hudBar = bar;
+    hud.appendChild(bar);
+
+    // Camera views pill — separate bottom-center element (normal mode only)
+    const hudViews = document.createElement('div');
+    hudViews.style.cssText = [
+      'position:absolute', 'bottom:12px', 'left:50%', 'transform:translateX(-50%)',
+      'z-index:10', 'display:none',
+      'align-items:center', 'gap:4px',
+      'max-width:min(92vw, 720px)',
+      'overflow-x:auto', 'overflow-y:hidden',
+      'flex-wrap:nowrap',
+      '-webkit-overflow-scrolling:touch',
+      'touch-action:pan-x',
+      'scrollbar-width:none',
+      'cursor:grab',
+      'background:rgba(8,12,24,0.72)',
+      'backdrop-filter:blur(12px)', '-webkit-backdrop-filter:blur(12px)',
+      'border:1px solid rgba(255,255,255,0.1)',
+      'border-radius:24px', 'padding:4px 6px',
+      'pointer-events:auto',
+      'opacity:0', 'transition:opacity .25s ease',
+      'user-select:none',
+    ].join(';');
+    // Masquer la scrollbar WebKit tout en gardant le swipe
+    const hideScroll = document.createElement('style');
+    hideScroll.textContent = '.houscape-hud-views::-webkit-scrollbar{display:none}';
+    card.appendChild(hideScroll);
+    hudViews.classList.add('houscape-hud-views');
+    this._enableHudViewsDragScroll(hudViews);
+    this._hudViews = hudViews;
+    card.appendChild(hudViews);
+
+    // Left: camera views (only used in edit mode toolbar)
+    const hudLeft = document.createElement('div');
+    hudLeft.style.cssText = 'display:flex;align-items:center;gap:2px;';
+    this._hudLeft = hudLeft;
+    bar.appendChild(hudLeft);
+
+    // Separator (kept for edit-mode compat, hidden in normal mode)
+    const sep = document.createElement('div');
+    sep.style.cssText = 'width:1px;height:18px;background:rgba(255,255,255,0.15);margin:0 4px;flex-shrink:0;display:none;';
+    this._hudSep = sep;
+    bar.appendChild(sep);
+
+    // Right: lock + pencil only
+    const hudRight = document.createElement('div');
+    hudRight.style.cssText = 'display:flex;align-items:center;gap:4px;flex-shrink:0;';
+    this._hudRight = hudRight;
+    bar.appendChild(hudRight);
+
+    // Les modules de la carte : barre d'outils, vues enregistrées, état.
+    this._restoreWallView();
+    this._tour = new Tour(this.overlayContainer);
+    this._ui = new CardHud(this.overlayContainer, this._scene?.settings?.ui, this._dockButtons(), {
+      getViews: () => normalizeViews(this._effectiveConfig.camera_views ?? [])
+        .filter((v) => !v.hidden && v.id)
+        .map((v) => ({ id: v.id!, label: v.label })),
+      flyTo: (id) => {
+        const v = normalizeViews(this._effectiveConfig.camera_views ?? []).find((x) => x.id === id);
+        if (v) this._viewMgr?.flyTo(v);
+      },
+      getFloors: () => this._floors().map((f) => ({ index: f.index, name: f.name })),
+      getActiveFloor: () => this._floorIndex(),
+      setFloor: (k) => this._setFloor(k),
+      getRooms: () => this._hudRooms(),
+      flyToRoom: (id) => this._flyToRoom(id),
+      getRoomDevices: (id) => this._roomDevices(id),
+      toggleDevice: (entityId) => this._hass?.callService(entityId.split('.')[0], 'toggle', { entity_id: entityId }),
+      moreInfo: (entityId) => this._openMoreInfo(entityId),
+      roomAllOff: (id) => this._roomAllOff(id),
+      getStatus: () => this._homeStatus(),
+      onPrefs: (prefs) => this._saveUiPrefs(prefs),
+      startTour: () => this._startViewTour(),
+    });
+    this._ui.setLite(resolveLevel(this._effectiveConfig?.rendering?.quality) !== 'high');
+    try { if (localStorage.getItem('houscape_perf_hud') === '1') this._setPerfHud(true); } catch { /* stockage bloqué */ }
+    this._ui.onHelloDismissed = () => markTourSeen();
+
+    // Hover (desktop) — show/hide HUD
+    card.addEventListener('mouseenter', () => this._showControls());
+    card.addEventListener('mouseleave', () => this._hideControls());
+    // Any pointer interaction keeps HUD visible (fixes disappearing buttons on click)
+    card.addEventListener('pointerdown', () => this._showControls());
+    // Touch — show HUD for 4 seconds on tap
+    card.addEventListener('touchstart', () => this._showControlsTemporarily(), { passive: true });
+
+    // Canvas tap detection for overlay toggle + panel direct drag in edit mode
+    this.canvas!.addEventListener('pointerdown', (e) => {
+      this._tapStartTime = e.timeStamp;
+      this._tapStartPos = { x: e.clientX, y: e.clientY };
+
+      // Edit mode: start panel drag directly on pointerdown (no G key needed)
+      if (this._editMode && e.button === 0 && !this._cardPlacementMode && this.camera && this.canvas) {
+        const rect = this.canvas!.getBoundingClientRect();
+        const ndc = new THREE.Vector2(
+          ((e.clientX - rect.left) / rect.width) * 2 - 1,
+          -((e.clientY - rect.top) / rect.height) * 2 + 1,
+        );
+
+        // First: check gizmo handles if a card is selected
+        if (this._selectedCardId && this._panelGizmo?.visible) {
+          const gizmoRay = new THREE.Raycaster();
+          gizmoRay.setFromCamera(ndc, this.camera!);
+          const gizmoHits = gizmoRay.intersectObjects(this._panelGizmo.getMeshes(), false);
+          if (gizmoHits.length) {
+            const axis = this._panelGizmo.getAxis(gizmoHits[0].object as THREE.Mesh);
+            if (axis) {
+              const card = this._cardRenderer?.getCard(this._selectedCardId)!;
+              const cardPos = new THREE.Vector3(...card.position);
+              this._editPanel?.pushCardSnapshot();
+              this._gizmoDragAxis = axis;
+              this._gizmoDragCardStartPos.copy(cardPos);
+
+              // Compute drag plane: perpendicular to the camera's view direction on the chosen axis
+              const axisVec = axis === 'x' ? new THREE.Vector3(1, 0, 0)
+                : axis === 'y' ? new THREE.Vector3(0, 1, 0)
+                : new THREE.Vector3(0, 0, 1);
+              const camFwd = new THREE.Vector3();
+              this.camera!.getWorldDirection(camFwd);
+              let planeNormal = new THREE.Vector3().crossVectors(axisVec, camFwd);
+              if (planeNormal.lengthSq() < 0.001) planeNormal.set(0, 1, 0);
+              else planeNormal.normalize();
+              this._gizmoDragPlane.setFromNormalAndCoplanarPoint(planeNormal, cardPos);
+
+              // Get initial intersection point on the drag plane
+              gizmoRay.ray.intersectPlane(this._gizmoDragPlane, this._gizmoDragStartIntersect);
+
+              if (this.controls) this.controls.enabled = false;
+              e.stopPropagation();
+              return;
+            }
+          }
+        }
+
+        // Then: check card mesh hit
+        const hit = this._cardRenderer?.handleClick(ndc);
+        if (hit) {
+          this._selectedCardId = hit;
+          this._cardRenderer?.setSelectedId(hit);
+          this._editor?.selectAnchor('');
+          this._editPanel?.updateAnchorList();
+          const card = this._cardRenderer?.getCard(hit);
+          if (card) {
+            // Show gizmo at card position
+            const cardPos = new THREE.Vector3(...card.position);
+            this._panelGizmo?.setPosition(cardPos);
+            this._panelGizmo?.setVisible(true);
+            this._panelGizmo?.updateScale(this.camera!);
+
+            this._editPanel?.pushCardSnapshot();
+            this._cardGrabMode = true;
+            this._cardGrabOrigin = [...card.position] as [number, number, number];
+            const camFwd = new THREE.Vector3();
+            this.camera!.getWorldDirection(camFwd);
+            camFwd.negate();
+            this._cardGrabPlane.setFromNormalAndCoplanarPoint(camFwd, cardPos);
+            if (this.controls) this.controls.enabled = false;
+          }
+        }
+      }
+    });
+
+    this.canvas!.addEventListener('pointerleave', () => { if (this._pickHoverKey) this._endPickHover(); });
+
+    this.canvas!.addEventListener('pointermove', (e) => {
+      if (!this.camera || !this.canvas) return;
+      const rect = this.canvas!.getBoundingClientRect();
+      const ndc = new THREE.Vector2(
+        ((e.clientX - rect.left) / rect.width) * 2 - 1,
+        -((e.clientY - rect.top) / rect.height) * 2 + 1,
+      );
+
+      // On désigne un ouvrant (ou l'hôte d'une lumière) : ce qu'un clic prendrait s'éclaire sous la souris.
+      if (this._editMode && this._partPickHandler) {
+        if (this._partPickMode === 'lightHost') this._handlePartPickHover(ndc);
+        else if (e.pointerType === 'mouse' && !e.buttons) this._queuePickHover(ndc);
+      }
+
+      // Gizmo hover highlight (when not dragging)
+      if (this._editMode && this._selectedCardId && this._panelGizmo?.visible && !this._gizmoDragAxis && !this._cardGrabMode) {
+        const hoverRay = new THREE.Raycaster();
+        hoverRay.setFromCamera(ndc, this.camera!);
+        const hoverHits = hoverRay.intersectObjects(this._panelGizmo.getMeshes(), false);
+        const hovAxis = hoverHits.length ? this._panelGizmo.getAxis(hoverHits[0].object as THREE.Mesh) : null;
+        this._panelGizmo.setHover(hovAxis);
+      }
+
+      // Card hover highlight (normal mode)
+      if (!this._editMode && this._cardRenderer) {
+        const hoveredId = this._cardRenderer.handleHover(ndc);
+        this._cardRenderer.setHoveredId(hoveredId);
+      }
+
+      // Gizmo axis drag
+      if (this._gizmoDragAxis && this._selectedCardId) {
+        const dragRay = new THREE.Raycaster();
+        dragRay.setFromCamera(ndc, this.camera!);
+        const currentIntersect = new THREE.Vector3();
+        if (dragRay.ray.intersectPlane(this._gizmoDragPlane, currentIntersect)) {
+          const delta = currentIntersect.clone().sub(this._gizmoDragStartIntersect);
+          const axisVec = this._gizmoDragAxis === 'x' ? new THREE.Vector3(1, 0, 0)
+            : this._gizmoDragAxis === 'y' ? new THREE.Vector3(0, 1, 0)
+            : new THREE.Vector3(0, 0, 1);
+          const movement = delta.dot(axisVec);
+          const newPos = this._gizmoDragCardStartPos.clone().addScaledVector(axisVec, movement);
+          this._cardRenderer?.previewPosition(this._selectedCardId, newPos);
+          this._panelGizmo?.setPosition(newPos);
+          this._requestRender();
+        }
+        return;
+      }
+
+      // Card free drag (grab mode)
+      if (this._cardGrabMode && this._selectedCardId) {
+        this._cardGrabRaycaster.setFromCamera(ndc, this.camera!);
+        const target = new THREE.Vector3();
+        if (this._cardGrabRaycaster.ray.intersectPlane(this._cardGrabPlane, target)) {
+          this._cardRenderer?.previewPosition(this._selectedCardId, target);
+          this._panelGizmo?.setPosition(target);
+          this._requestRender();
+        }
+      }
+    });
+
+    this.canvas!.addEventListener('pointerup', (e) => {
+      // Gizmo axis drag end — confirm position
+      if (this._gizmoDragAxis && e.button === 0) {
+        this._gizmoDragAxis = null;
+        if (this.controls) this.controls.enabled = !this._locked;
+        this._panelGizmo?.setHover(null);
+
+        if (this._selectedCardId) {
+          const mesh = this._cardRenderer?.getMeshes().find(m => m.userData.cardId === this._selectedCardId);
+          if (mesh) {
+            const newPos: [number, number, number] = [
+              +mesh.position.x.toFixed(4),
+              +mesh.position.y.toFixed(4),
+              +mesh.position.z.toFixed(4),
+            ];
+            const cards = (this._scene?.cards ?? []).map(c =>
+              c.id === this._selectedCardId ? { ...c, position: newPos } : c,
+            );
+            this._saveCardsDirect(cards);
+          }
+        }
+        return;
+      }
+
+      // Card grab confirm or cancel (if barely moved = select only)
+      if (this._cardGrabMode && e.button === 0) {
+        const dx = e.clientX - this._tapStartPos.x;
+        const dy = e.clientY - this._tapStartPos.y;
+        if (Math.hypot(dx, dy) < 5) {
+          // Just a click to select, not a real drag — cancel without saving
+          this._cardGrabMode = false;
+          this._cardGrabOrigin = null;
+          if (this.controls) this.controls.enabled = !this._locked;
+          this._editPanel?.hideStatusBar();
+        } else {
+          this._confirmCardGrab();
+        }
+        return;
+      }
+
+      const dt = e.timeStamp - this._tapStartTime;
+      const dx = e.clientX - this._tapStartPos.x;
+      const dy = e.clientY - this._tapStartPos.y;
+      const isTap = dt < 250 && Math.hypot(dx, dy) < 10;
+
+      // Edit mode
+      if (this._editMode && isTap) {
+        const rect = this.canvas!.getBoundingClientRect();
+        const ndc = new THREE.Vector2(
+          ((e.clientX - rect.left) / rect.width) * 2 - 1,
+          -((e.clientY - rect.top) / rect.height) * 2 + 1,
+        );
+
+        // La sélection d'une pièce du modèle passe avant tout : l'éditeur
+        // attend explicitement ce clic.
+        if (this._partPickHandler) {
+          if (!this._handlePartPick(ndc, e)) {
+            // Clic dans le vide : on annule plutôt que de laisser l'éditeur
+            // attendre indéfiniment.
+            this._partPickHandler = null;
+            this._partPickMode = 'part';
+            if (this.canvas) this.canvas.style.cursor = '';
+            this._clearPartPickHover();
+            this._editPanel?.hideStatusBar();
+            this._endPickHover();
+          }
+          return;
+        }
+
+        // Card placement mode takes priority
+        if (this._cardPlacementMode && this._cardPlacementType && this.scene && this.camera) {
+          const raycaster = new THREE.Raycaster();
+          raycaster.setFromCamera(ndc, this.camera!);
+          const objects: THREE.Object3D[] = [];
+          this.scene!.traverse((o) => { if ((o as THREE.Mesh).isMesh && !o.userData.cardId) objects.push(o); });
+          const hits = raycaster.intersectObjects(objects, false);
+          if (hits.length === 0) {
+            // Click outside model — cancel placement
+            this._cardPlacementMode = false;
+            this._cardPlacementType = null;
+            this._editPanel?.hideStatusBar();
+            if (this.canvas) this.canvas.style.cursor = '';
+            return;
+          }
+          const pos: [number, number, number] = [
+            +hits[0].point.x.toFixed(3),
+            +(hits[0].point.y + this._modelSpan * 0.04).toFixed(3),
+            +hits[0].point.z.toFixed(3),
+          ];
+          this._placeNewCard(this._cardPlacementType, pos);
+          return;
+        }
+
+        // Deselect if clicked outside a card
+        const hit = this._cardRenderer?.handleClick(ndc);
+        if (!hit && this._selectedCardId) {
+          this._selectedCardId = null;
+          this._cardRenderer?.setSelectedId(null);
+          this._panelGizmo?.setVisible(false);
+          this._editPanel?.updateAnchorList();
+        }
+        return;
+      }
+
+      if (this._editMode) return;
+
+      // Card fly-to double click (normal mode)
+      if (isTap) {
+        const rect = this.canvas!.getBoundingClientRect();
+        const ndc = new THREE.Vector2(
+          ((e.clientX - rect.left) / rect.width) * 2 - 1,
+          -((e.clientY - rect.top) / rect.height) * 2 + 1,
+        );
+        const hitCardId = this._cardRenderer?.handleClick(ndc);
+        if (hitCardId) {
+          const now = e.timeStamp;
+          if (now - this._lastClickTime < 400 && this._lastClickCardId === hitCardId) {
+            if (this._cardFocusId === hitCardId) {
+              this._exitCardFocus();
+            } else {
+              this._enterCardFocus(hitCardId);
+            }
+            this._lastClickTime = 0;
+            this._lastClickCardId = null;
+          } else {
+            this._lastClickTime = now;
+            this._lastClickCardId = hitCardId;
+          }
+          return;
+        } else {
+          this._lastClickCardId = null;
+        }
+
+        // Deux touches sur une pièce : on y va. La première a pu masquer les
+        // pastilles (tap_to_toggle) : la seconde les rend.
+        if (this._floorDoubleTap(e)) {
+          if (this._config?.tap_to_toggle) this._toggleOverlays();
+          return;
+        }
+
+        // Tap to toggle overlays
+        if (this._config?.tap_to_toggle) {
+          this._toggleOverlays();
+        }
+      }
+    });
+
+    this._initThree(card);
+
+    this.ro = new ResizeObserver(() => this._onResize());
+    this.ro.observe(card);
+    // L'observateur ne voit que la carte : une fenêtre qui change seulement de
+    // hauteur ne la redimensionne pas. En `fill`, c'est pourtant ce qui compte.
+    window.addEventListener('resize', this._onWindowResize);
+
+    // If scene_id is set, defer model loading until hass is available.
+    // The hass setter will call _fetchAndLoadScene → _loadModel.
+    if (!this._getActiveSceneId() && !this._config?.model_url) {
+      this._showSetupOverlay();
+    } else if (!this._getActiveSceneId() || this._scene) {
+      this._loadModel();
+    }
+  }
+
+  /**
+   * Bandeau de la maison de démonstration.
+   *
+   * Il dit ce qu'on regarde et quoi en faire : sans lui, une maison qu'on n'a
+   * pas dessinée passerait pour un bug. On peut le fermer ; il revient au
+   * rechargement tant qu'aucun modèle n'est configuré.
+   */
+  private _showDemoBanner() {
+    if (!this.overlayContainer || this.overlayContainer.querySelector('#houscape-demo-banner')) return;
+    // L'accueil d'une carte toute neuve : ce qu'on regarde, et par où commencer.
+    const banner = document.createElement('div');
+    banner.id = 'houscape-demo-banner';
+    banner.className = 'ow-ui ow-surface';
+    banner.setAttribute('role', 'region');
+    banner.setAttribute('aria-label', t('demoTitle'));
+    banner.style.cssText = [
+      'position:absolute', 'top:12px', 'left:50%', 'transform:translateX(-50%)', 'z-index:40',
+      'width:min(520px, calc(100% - 24px))', 'padding:12px 14px', 'display:flex', 'flex-direction:column', 'gap:8px',
+      'pointer-events:auto',
+    ].join(';');
+    if (this._editMode) banner.style.display = 'none';
+    const head = document.createElement('div');
+    head.style.cssText = 'display:flex;align-items:center;gap:8px;';
+    const title = document.createElement('strong');
+    title.style.cssText = 'flex:1;font-size:14px;';
+    title.textContent = t('demoTitle');
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'ow-ib';
+    close.style.cssText = 'width:28px;height:28px;';
+    close.setAttribute('aria-label', t('tourClose'));
+    close.append(uiIcon('close', 15));
+    close.addEventListener('click', () => banner.remove());
+    head.append(title, close);
+    const text = document.createElement('div');
+    text.style.cssText = 'font-size:12.5px;color:var(--ow-muted);line-height:1.45;';
+    text.textContent = t('demoBanner');
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;';
+    const btn = (iconName: string, label: string, onClick: () => void, primary = false) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = `ow-btn ow-small${primary ? ' ow-primary' : ''}`;
+      b.append(uiIcon(iconName, 15), document.createTextNode(label));
+      b.addEventListener('click', (e) => { e.stopPropagation(); onClick(); });
+      row.append(b);
+    };
+    if (this._canImport()) {
+      btn('pencil', t('planDraw'), () => this.openPlanEditor(), true);
+      btn('plus', t('importButton'), () => pickFiles((files) => this._importModel(files)));
+    }
+    btn('help', t('uiHelp'), () => { banner.remove(); this._startViewTour(); });
+    banner.append(head, text, row);
+    this.overlayContainer.appendChild(banner);
+  }
+
+  /**
+   * Relie un emplacement de la démo à une entité choisie par l'utilisateur.
+   *
+   * La scène est enregistrée tout de suite : relier une lampe est un geste
+   * complet, on ne demande pas d'entrer en mode édition pour le valider.
+   */
+  private _linkPlaceholder(name: string) {
+    if (!this._hass || !this._scene || !this.overlayContainer) return;
+    const index = Number(name.replace('anchor_cfg_', ''));
+    const target = this._scene.anchors[index];
+    if (!target) return;
+
+    const placed = new Set(this._scene.anchors.map((a) => a.entity).filter(Boolean));
+    openEntityPicker({
+      container: this.overlayContainer,
+      hass: this._hass,
+      placed,
+      onCancel: () => {},
+      onPick: (entity) => {
+        if (!this._scene) return;
+        const anchors = this._scene.anchors.map((a, i) => (i === index ? { ...a, entity } : a));
+        this._scene = { ...this._scene, anchors };
+        // L'éditeur garde sa propre copie des ancres, faite à l'entrée en
+        // édition. Si on relie pendant qu'il est ouvert, la sortie du mode
+        // édition réappliquerait l'ancienne copie et effacerait la liaison.
+        this._editor?.updateAnchor(name, { entity });
+        this._rebuildAnchors();
+        const sceneId = this._getActiveSceneId();
+        if (sceneId && this._hass) {
+          saveScene(this._hass, sceneId, this._scene)
+            .then(() => this._showToast(t('toastSceneSaved')))
+            .catch(() => this._showToast(t('toastSceneSaveError'), true));
+        }
+      },
+    });
+  }
+
+  /** L'intégration ne répond pas : on le dit, et on rassure sur les scènes. */
+  private _showBackendDown() {
+    if (!this.overlayContainer || this.overlayContainer.querySelector('#houscape-backend-down')) return;
+    const box = document.createElement('div');
+    box.id = 'houscape-backend-down';
+    box.style.cssText = [
+      'position:absolute', 'inset:0', 'display:flex', 'flex-direction:column',
+      'align-items:center', 'justify-content:center', 'gap:8px', 'z-index:50',
+      'padding:24px', 'box-sizing:border-box', 'text-align:center', 'pointer-events:none',
+      'font-family:var(--primary-font-family,sans-serif)',
+    ].join(';');
+    const title = document.createElement('div');
+    title.style.cssText = 'font-size:14px;font-weight:700;color:#fbbf24;';
+    title.textContent = `⚠ ${t('backendDownTitle')}`;
+    const body = document.createElement('div');
+    body.style.cssText = 'font-size:12px;color:#94a3b8;max-width:380px;line-height:1.5;';
+    body.textContent = t('backendDownHint');
+    box.append(title, body);
+    this.overlayContainer.appendChild(box);
+  }
+
+  /** Importer un plan écrit sur le serveur : réservé aux administrateurs. */
+  private _canImport(): boolean {
+    // Seul un refus explicite cache l'import : le serveur vérifie de toute façon
+    // les droits, et un `hass` sans `user` ne doit pas priver l'administrateur.
+    return this._hass?.user?.is_admin !== false && !!this._getActiveSceneId() && !this._backendDown;
+  }
+
+  /**
+   * Importe un plan déposé ou choisi, et l'affiche à la place du modèle actuel.
+   *
+   * La scène garde ses ancres et ses ouvrants : réexporter sa maison après
+   * l'avoir retouchée ne doit pas obliger à tout replacer. Seule la maison de
+   * démonstration repart de zéro, ses emplacements n'ayant rien à voir avec le
+   * plan de l'utilisateur.
+   */
+  private async _importModel(source: FileSystemEntry[] | File[]) {
+    // Un fichier Sweet Home 3D devient un plan modifiable, pas un modèle figé.
+    const sh3d = await sh3dFileOf(source);
+    if (sh3d) { await this._importSh3d(sh3d); return; }
+    const sceneId = this._getActiveSceneId();
+    if (!this._hass || !this.overlayContainer || this._importing) return;
+    if (!sceneId) { this._showToast(t('importNoScene'), true); return; }
+    this._importing = true;
+    // Sortir d'édition tout de suite : la sortie enregistre la scène, et cet
+    // enregistrement doit être fini avant qu'on n'écrive la nôtre.
+    if (this._editMode) this._exitEditMode();
+    this.overlayContainer.querySelector('#houscape-demo-banner')?.remove();
+
+    const progress = new ImportProgress(this.overlayContainer);
+    try {
+      const { url, stats } = await importModel(
+        this._hass, source,
+        (stage, f) => progress.stage(stage, f),
+        (estimate) => progress.askLighten(estimate),
+      );
+      progress.stage('loading');
+
+      const wasDemo = this._isDemo;
+      const oldSpan = this.modelLoaded ? this._modelSpan : 0;
+      const base = this._scene ?? emptyScene(sceneId);
+      // Les distances d'orbite sont absolues : réglées pour un modèle en
+      // mètres, elles enfermeraient la caméra dans un modèle en centimètres.
+      const orbit = base.settings?.orbit;
+      const settings = base.settings && {
+        ...base.settings,
+        orbit: orbit?.max_polar_angle !== undefined ? { max_polar_angle: orbit.max_polar_angle } : undefined,
+      };
+      // Démo : tout jeter (ancres / ouvrants / effets d'une maison étrangère).
+      // Maison réelle : garder la config — cibles absentes sont signalées, pas
+      // fatales ; un effet pourri ne doit plus empêcher le nouveau GLB de charger.
+      let scene: HouscapeScene = wasDemo
+        ? { ...base, settings, model_url: url, anchors: [], camera_views: [], parts: [], effects: [] }
+        : { ...base, settings, model_url: url };
+      await saveScene(this._hass, sceneId, scene);
+      this._scene = scene;
+      // Le point de vue enregistré visait l'ancien modèle.
+      localStorage.removeItem(this._storageKey);
+      progress.done();
+      await this._loadModel();
+
+      // Pas la même taille : ce n'est pas une retouche du même plan, et les
+      // vues enregistrées regarderaient dans le vide.
+      const ratio = oldSpan > 0 ? this._modelSpan / oldSpan : 1;
+      if (scene.camera_views?.length && (ratio < 0.8 || ratio > 1.25)) {
+        scene = { ...scene, camera_views: [] };
+        this._scene = scene;
+        await saveScene(this._hass, sceneId, scene);
+      }
+
+      if (stats?.missingTextures.length) {
+        this._showToast(`${t('importMissingTextures')} (${stats.missingTextures.length})`, true);
+      } else {
+        this._showToast(t('importDone'));
+      }
+
+      this._offerDetectedOpenings();
+    } catch (err) {
+      console.error('[Houscape] import failed:', err);
+      progress.fail(this._importErrorMessage(err));
+    } finally {
+      this._importing = false;
+    }
+  }
+
+  /**
+   * Importe un fichier Sweet Home 3D : la maison devient un plan qu'on modifie
+   * dans l'éditeur, ses meubles rejoignent « Mes meubles ».
+   *
+   * Si la scène affichait déjà ce logement importé à l'ancienne (l'export
+   * OBJ), tout ce qui y était posé est recalé sur le nouveau plan : ancres,
+   * vues et ouvrants, avec leurs capteurs. Rien n'est à refaire.
+   */
+  private async _importSh3d(file: File) {
+    const sceneId = this._getActiveSceneId();
+    if (!this._hass || !this.overlayContainer || this._importing) return;
+    if (!sceneId) { this._showToast(t('importNoScene'), true); return; }
+    this._importing = true;
+    const reopen = !!this._planEditor;
+    this._planEditor?.close();
+    if (this._editMode) this._exitEditMode();
+    this.overlayContainer.querySelector('#houscape-demo-banner')?.remove();
+
+    const progress = new ImportProgress(this.overlayContainer);
+    try {
+      progress.stage('reading');
+      const zip = unzipSync(new Uint8Array(await file.arrayBuffer()));
+      if (!zip['Home.xml']) throw new Error(t('sh3dFileOld'));
+      const home = readHome(strFromU8(zip['Home.xml']));
+      // Chaque niveau qui a des murs devient un étage.
+      let n = 0;
+      const conv = homeToHouse(home, {
+        room: () => `${t('planRoom')} ${++n}`,
+        floor: () => '#d8c3a5',
+      });
+      if (!conv.plan.walls.length) throw new Error(t('sh3dFileEmpty'));
+
+      progress.stage('uploading', 0);
+      const simplify = await makeSimplifier().catch(() => undefined);
+      const furniture = await importSh3dFurniture(this._hass as unknown as UploadHass, zip, conv.items, {
+        simplify, onProgress: (f) => progress.stage('uploading', f),
+      });
+      // Chaque meuble rejoint le plan de son niveau.
+      const onFloor = (k: number) => furniture.items.filter((_, i) => furniture.floors[i] === k);
+      const plan: PlanDoc = {
+        ...conv.plan,
+        items: onFloor(0),
+        library: furniture.library,
+        ...(conv.plan.floors ? { floors: conv.plan.floors.map((f, i) => ({ ...f, doc: { ...f.doc, items: onFloor(i + 1) } })) } : {}),
+      };
+      progress.stage('loading');
+
+      // Ce qui était posé sur l'ancien modèle suit le logement.
+      const base = this._scene ?? emptyScene(sceneId);
+      const moved = this._isDemo ? null : this._sh3dMigration(home, conv.ground?.id, plan, base);
+      const orbit = base.settings?.orbit;
+      const settings = base.settings && {
+        ...base.settings,
+        orbit: orbit?.max_polar_angle !== undefined ? { max_polar_angle: orbit.max_polar_angle } : undefined,
+      };
+      const scene: HouscapeScene = this._isDemo
+        ? { ...base, settings, plan, anchors: [], camera_views: [], parts: [] }
+        : { ...base, settings, plan, ...(moved ?? {}) };
+      await saveScene(this._hass, sceneId, scene);
+      this._scene = scene;
+      try { localStorage.removeItem(this._storageKey); } catch { /* stockage bloqué */ }
+      // Une maison neuve s'ouvre au rez-de-chaussée.
+      try { localStorage.removeItem(this._floorKey); } catch { /* stockage bloqué */ }
+      this._activeFloor = 0;
+      this._syncPlanPartsAfterLoad = true;
+      progress.done();
+      await this._loadModel();
+
+      const notes: string[] = [];
+      if (conv.levels > 1) notes.push(t('sh3dLevels').replace('{n}', String(conv.levels)));
+      if (furniture.failed) notes.push(t('sh3dFurnitureFailed').replace('{n}', String(furniture.failed)));
+      if (conv.skipped.openings) notes.push(t('sh3dOpeningsSkipped').replace('{n}', String(conv.skipped.openings)));
+      if (moved?.lost) notes.push(t('sh3dPartsLost').replace('{n}', String(moved.lost)));
+      if (moved === null && !this._isDemo && (base.anchors?.length ?? 0) && !base.plan) notes.push(t('sh3dAnchorsUnmoved'));
+      const levels = floorViews(plan);
+      const total = (f: (d: PlanDoc) => number) => levels.reduce((s, v) => s + f(v.doc), 0);
+      this._showToast([t('sh3dImported')
+        .replace('{walls}', String(total((d) => d.walls.length)))
+        .replace('{openings}', String(total((d) => d.openings.length)))
+        .replace('{items}', String(total((d) => d.items?.length ?? 0))), ...notes].join(' '), notes.length > 0);
+      if (reopen) this.openPlanEditor();
+    } catch (err) {
+      console.error('[Houscape] Sweet Home 3D import failed:', err);
+      progress.fail(this._importErrorMessage(err));
+    } finally {
+      this._importing = false;
+    }
+  }
+
+  /**
+   * Recale ancres, vues et ouvrants de l'ancien modèle sur le plan importé.
+   * `null` quand il n'y a rien à recaler, ou que l'ancien modèle n'est pas ce
+   * logement (alors on ne touche à rien plutôt que de tout déplacer de travers).
+   */
+  private _sh3dMigration(home: Sh3dHome, level: string | undefined, plan: PlanDoc, base: HouscapeScene):
+    (Pick<HouscapeScene, 'anchors' | 'camera_views' | 'parts'> & { lost: number }) | null {
+    const root = this._modelRoot;
+    if (!root || base.plan || root.name === 'houscape_plan') return null;
+
+    // Les murs de l'ancien modèle (l'export OBJ les nomme), dans son propre repère.
+    root.updateMatrixWorld(true);
+    const walls = new THREE.Box3(), rest = new THREE.Box3();
+    root.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (!m.isMesh || o.userData.houscapeHelper || o.userData.houscapeBatch) return;
+      const b = new THREE.Box3().setFromObject(m);
+      let named = false;
+      for (let q: THREE.Object3D | null = m; q && q !== root; q = q.parent) if (/^wall/i.test(q.name)) named = true;
+      if (named) walls.union(b);
+      else if (!/ground|terrain/i.test(m.name)) rest.union(b);
+    });
+    const used = walls.isEmpty() ? rest : walls;
+    if (used.isEmpty()) return null;
+    const oldRoot: Vec3 = [root.position.x, root.position.y, root.position.z];
+    const model: FitBox = {
+      min: [used.min.x - oldRoot[0], used.min.y - oldRoot[1], used.min.z - oldRoot[2]],
+      max: [used.max.x - oldRoot[0], used.max.y - oldRoot[1], used.max.z - oldRoot[2]],
+    };
+    const own = home.walls.filter((w) => !level || w.level === level || !w.level);
+    const box: FitBox = { min: [Infinity, Infinity, 0], max: [-Infinity, -Infinity, 0] };
+    for (const w of own) {
+      const half = w.thickness / 2;
+      box.min[0] = Math.min(box.min[0], Math.min(w.xStart, w.xEnd) - half);
+      box.max[0] = Math.max(box.max[0], Math.max(w.xStart, w.xEnd) + half);
+      box.min[1] = Math.min(box.min[1], Math.min(w.yStart, w.yEnd) - half);
+      box.max[1] = Math.max(box.max[1], Math.max(w.yStart, w.yEnd) + half);
+      box.max[2] = Math.max(box.max[2], w.height ?? home.wallHeight, w.heightAtEnd ?? 0);
+    }
+    const fit = fitSh3d(box, model);
+    if (!fit) return null;
+
+    // Où le nouveau plan se posera : même calcul que `_loadModel`.
+    const built = buildPlan(plan);
+    const centre = new THREE.Box3().setFromObject(built).getCenter(new THREE.Vector3());
+    const o = this._planOrigin(plan);
+    const newRoot: Vec3 = [-o.x, -centre.y, -o.y];
+    const move = makeMover(fit, oldRoot, newRoot);
+
+    const anchors = (base.anchors ?? []).map((a) => ({
+      ...a,
+      position: move.point(a.position),
+      ...(a.lightDirection ? { lightDirection: move.direction(a.lightDirection) } : {}),
+    }));
+    const camera_views = (base.camera_views ?? []).map((v) => ({ ...v, position: move.point(v.position), target: move.point(v.target) }));
+
+    // Chaque ancien ouvrant passe au vantail du plan le plus proche, avec ses réglages.
+    const olds: { item: HouscapePart; at: Vec3 }[] = [];
+    for (const part of base.parts ?? []) {
+      const b = this._parts.boxOf(part.id);
+      if (!b || b.isEmpty()) continue;
+      const c = b.getCenter(new THREE.Vector3());
+      olds.push({ item: part, at: move.point([c.x, c.y, c.z]) });
+    }
+    const leaves: { item: string; at: Vec3 }[] = [];
+    built.updateMatrixWorld(true);
+    built.traverse((n) => {
+      if (!n.userData.houscapeLeaf) return;
+      const c = new THREE.Box3().setFromObject(n).getCenter(new THREE.Vector3());
+      leaves.push({ item: n.name, at: [c.x + newRoot[0], c.y + newRoot[1], c.z + newRoot[2]] });
+    });
+    const match = matchNearest(olds, leaves, 0.8);
+    const parts: HouscapePart[] = [];
+    for (const [old, node] of match) {
+      // Seuls les réglages de l'utilisateur passent : la géométrie vient du plan.
+      const { id, entity, label, angle, travel, openWhen, invert, duration, closedColor, openColor, tintStrength, tilt } = old;
+      parts.push({
+        id, entity, label, angle, travel, openWhen, invert, duration, closedColor, openColor, tintStrength, tilt,
+        node, mesh: '', triangle: 0, motion: old.motion,
+      });
+    }
+    return { anchors, camera_views, parts, lost: (base.parts?.length ?? 0) - parts.length };
+  }
+
+  /** Portes et fenêtres Sweet Home 3D du modèle, pas encore dans la scène. */
+  /**
+   * Après un import : propose les portes et fenêtres reconnues.
+   *
+   * Sans ouvrant dans la scène, un seul choix : les ajouter. Avec des ouvrants
+   * déjà là (ceux d'un import précédent, ou désignés à la main sur l'ancien
+   * modèle), on laisse décider : les garder, compléter avec les nouveaux, ou
+   * tout remplacer en gardant les capteurs déjà reliés.
+   */
+  private _offerDetectedOpenings() {
+    const all = this._detectedOpenings(true);
+    if (!all.length || !this.overlayContainer) return;
+    const existing = this._scene?.parts?.length ?? 0;
+    const fresh = this._detectedOpenings().length;
+    // Une fenêtre à deux vantaux compte pour une fenêtre.
+    const count = (kind: 'door' | 'window') => new Set(all.filter((f) => f.kind === kind).map((f) => f.piece)).size;
+    const choices = existing === 0
+      ? [
+          { label: t('sh3dLater'), onClick: () => {} },
+          { label: t('sh3dAdd'), primary: true, onClick: () => { this._addDetectedOpenings(); } },
+        ]
+      : [
+          { label: t('sh3dKeep'), onClick: () => {} },
+          ...(fresh > 0
+            ? [{ label: t('sh3dAddNew').replace('{n}', String(fresh)), onClick: () => { this._addDetectedOpenings(); } }]
+            : []),
+          { label: t('sh3dReplace'), primary: true, onClick: () => { this._replaceWithDetected(); } },
+        ];
+    askOpenings(this.overlayContainer, count('door'), count('window'), existing, choices);
+  }
+
+  /** Remplace les ouvrants par ceux reconnus, capteurs et réglages gardés. */
+  private async _replaceWithDetected() {
+    const detected = this._detectedOpenings(true).map((f) => f.part);
+    if (!detected.length) return;
+    const before = this._scene?.parts ?? [];
+    const known = new Set(before.map((p) => p.node).filter(Boolean));
+    const merged = replaceParts(before, detected);
+    // On repart de zéro : les anciens ouvrants libèrent leurs pièces avant
+    // que les nouveaux ne les prennent.
+    await this._savePartsDirect([]);
+    await this._savePartsDirect(merged);
+    // Seuls les vantaux nouveaux sont orientés : les autres gardent le sens
+    // que l'utilisateur a peut-être corrigé.
+    await this._orientInward(new Set(merged.filter((p) => !known.has(p.node)).map((p) => p.id)));
+    this._showToast(t('sh3dReplaced'));
+  }
+
+  /** `all` : tous les vantaux reconnus, y compris ceux déjà dans la scène. */
+  private _detectedOpenings(all = false) {
+    if (!this._modelRoot) return [];
+    return proposeParts(
+      findLeaves(this._modelRoot, this._modelSpan),
+      all ? [] : this._scene?.parts ?? [],
+      (kind, n, leaf, leaves) =>
+        `${t(kind === 'door' ? 'sh3dDoor' : 'sh3dWindow')} ${n}${leaves > 1 ? ` · ${t('sh3dLeaf')} ${leaf}` : ''}`,
+    );
+  }
+
+  private async _addDetectedOpenings() {
+    const found = this._detectedOpenings().map((f) => f.part);
+    if (!found.length) return;
+    await this._savePartsDirect([...(this._scene?.parts ?? []), ...found]);
+    await this._orientInward(new Set(found.map((p) => p.id)));
+    this._showToast(t('sh3dAdded'));
+  }
+
+  /** Une fois montés, oriente ces battants vers l'intérieur de la maison. */
+  private async _orientInward(added: Set<string>) {
+    let flipped = false;
+    const parts = (this._scene?.parts ?? []).map((p) => {
+      if (!added.has(p.id)) return p;
+      const side = this._parts.inwardSide(p.id);
+      if (!side || side === (p.swingSide ?? 'front')) return p;
+      flipped = true;
+      const next = { ...p, swingSide: side };
+      this._parts.configure(next);
+      return next;
+    });
+    if (flipped) await this._savePartsDirect(parts);
+    this._requestRender();
+  }
+
+  private _importErrorMessage(err: unknown): string {
+    if (err instanceof ImportError) {
+      return t(({ empty: 'importErrEmpty', 'gltf-text': 'importErrGltf', 'no-model': 'importErrNoModel' } as const)[err.reason]);
+    }
+    if (err instanceof UploadError) {
+      if (err.status === 403) return t('importErrAdmin');
+      if (err.status === 413) return t('importErrTooBig');
+      // Une intégration d'avant l'import ne connaît pas cette adresse.
+      if (err.status === 404 || err.status === 405) return t('importErrIntegration');
+      return `${t('importErrGeneric')} (${err.status}: ${err.message})`;
+    }
+    return `${t('importErrGeneric')} (${err instanceof Error ? err.message : String(err)})`;
+  }
+
+  /** Reconstruit ancres, lumières et pastilles depuis la configuration effective. */
+  private _rebuildAnchors() {
+    if (!this.scene || !this._modelRoot) return;
+    this.anchors.forEach((entry) => {
+      if (this.scene) disposeEntryLights(entry, this.scene);
+    });
+    this._lightEmissive.dispose();
+    this.anchors = detectAnchors(this._modelRoot, this.scene, this._effectiveConfig, this._modelSpan);
+    this._ovPosPool.clear();
+    this._applyAttachPositions();
+    this._refreshLightHosts();
+    this._createOverlays();
+    if (this._hass) {
+      syncLights(this.anchors, this._hass, this._effectiveConfig, this._modelSpan);
+      this._lightEmissive.sync(this._modelRoot, this.anchors, this._hass);
+      this._updateOverlayStates();
+    }
+    this._ui?.refreshStatus();
+    this._ui?.refreshRooms();
+    this._applyFloorLights();
+    this._requestRender();
+  }
+
+  /** Applique `attachLightToObject` / pose mesh une fois au chargement / rebuild. */
+  private _applyAttachPositions() {
+    if (!this._modelRoot) return;
+    this.anchors.forEach((entry) => {
+      if (entry.domain !== 'light' || !hasLightHost(entry)) return;
+      const hosts = resolveLightHosts(this._modelRoot!, entry)
+        .filter((h) => !hostIsOpeningPiece(h));
+      if (!hosts.length) return;
+      if (hasMeshStyle(entry)) syncMeshLightPoses(entry, hosts);
+      if (!entry.attachLightToObject) return;
+      // Mesh-only : le marqueur peut suivre le centre AABB ; les rects restent sur les hôtes.
+      const center = lightHostsCenter(hosts);
+      entry.worldPos.copy(center);
+      for (const light of castLightsOf(entry)) {
+        if (light instanceof THREE.RectAreaLight) continue;
+        light.position.copy(center);
+      }
+      for (const target of castLightTargetsOf(entry)) {
+        target.position.copy(lightTargetPos(center, entry.lightDirection));
+        target.updateMatrixWorld();
+      }
+    });
+  }
+
+  private _showSetupOverlay() {
+    const card = this.querySelector('ha-card') as HTMLElement;
+    if (!card) return;
+
+    const overlay = document.createElement('div');
+    overlay.id = 'houscape-setup-overlay';
+    overlay.style.cssText = [
+      'position:absolute', 'inset:0',
+      'display:flex', 'flex-direction:column', 'align-items:center', 'justify-content:center',
+      'background:rgba(6,10,20,0.92)',
+      'backdrop-filter:blur(12px)', '-webkit-backdrop-filter:blur(12px)',
+      'z-index:50', 'padding:24px', 'box-sizing:border-box', 'pointer-events:auto',
+      'font-family:var(--primary-font-family,sans-serif)',
+    ].join(';');
+
+    const title = document.createElement('div');
+    title.style.cssText = 'font-size:16px;font-weight:700;color:#7dd3fc;letter-spacing:.06em;margin-bottom:6px;';
+    title.textContent = 'Houscape';
+
+    const subtitle = document.createElement('div');
+    subtitle.style.cssText = 'font-size:11px;color:rgba(255,255,255,0.4);margin-bottom:24px;letter-spacing:.04em;';
+    subtitle.textContent = '3D Floorplan';
+
+    const label = document.createElement('div');
+    label.style.cssText = 'font-size:10px;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;align-self:flex-start;max-width:280px;width:100%;';
+    label.textContent = t('cfgSceneId');
+
+    const inputRow = document.createElement('div');
+    inputRow.style.cssText = 'display:flex;gap:6px;width:100%;max-width:280px;margin-bottom:16px;';
+
+    const input = document.createElement('input');
+    input.placeholder = 'my_home';
+    input.style.cssText = [
+      'flex:1', 'background:rgba(255,255,255,0.05)', 'border:1px solid rgba(255,255,255,0.1)',
+      'border-radius:8px', 'color:#e2e8f0', 'padding:8px 10px',
+      'font-size:12px', 'outline:none', 'font-family:inherit',
+    ].join(';');
+    input.setAttribute('list', 'houscape-scenes-dl');
+
+    const dl = document.createElement('datalist');
+    dl.id = 'houscape-scenes-dl';
+    if (this._hass) {
+      listScenes(this._hass).then((ids) => ids.forEach((id) => {
+        const opt = document.createElement('option'); opt.value = id; dl.appendChild(opt);
+      })).catch(() => {});
+    }
+
+    const loadBtn = document.createElement('button');
+    loadBtn.textContent = t('cfgLoadScene');
+    loadBtn.style.cssText = [
+      'background:rgba(125,209,252,0.15)', 'border:1px solid rgba(125,209,252,0.3)',
+      'border-radius:8px', 'color:#7dd3fc', 'padding:8px 14px',
+      'font-size:12px', 'font-family:inherit', 'cursor:pointer', 'white-space:nowrap',
+    ].join(';');
+    loadBtn.addEventListener('click', () => {
+      const id = input.value.trim();
+      if (!id) return;
+      this._setActiveSceneId(id);
+      overlay.remove();
+      this._bootstrap();
+    });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') loadBtn.click(); });
+
+    inputRow.appendChild(input);
+    inputRow.appendChild(dl);
+    inputRow.appendChild(loadBtn);
+
+    const hint = document.createElement('div');
+    hint.style.cssText = 'font-size:10px;color:rgba(255,255,255,0.25);max-width:280px;width:100%;line-height:1.6;';
+    hint.innerHTML = 'Also add to your Lovelace YAML:<br><code style="background:rgba(255,255,255,0.07);border-radius:4px;padding:2px 6px;color:#93c5fd;">model_url: /local/model.glb</code>';
+
+    overlay.appendChild(title);
+    overlay.appendChild(subtitle);
+    overlay.appendChild(label);
+    overlay.appendChild(inputRow);
+    overlay.appendChild(hint);
+    this.overlayContainer?.appendChild(overlay);
+  }
+
+  /** La vue des murs retenue sur cet appareil. */
+  private _restoreWallView() {
+    let saved = '0';
+    try { saved = localStorage.getItem(LOW_WALLS_KEY) ?? '0'; } catch { /* stockage bloqué */ }
+    this._lowWalls.setView(WALL_VIEWS[Number(saved)] ?? 'up', null);
+  }
+
+  private _paintLowWallsBtn() {
+    this._ui?.refreshDock();
+  }
+
+  /**
+   * Les boutons de la barre d'outils, dans l'ordre. Les icônes du YAML
+   * (`ui.icons`) remplacent les dessins quand elles sont données.
+   */
+  private _dockButtons(): DockButton[] {
+    const ui = () => this._config?.ui ?? {};
+    const custom = () => ui().icons ?? {};
+    return [
+      {
+        id: 'walls', icon: 'walls', label: () => `${t('wallViewTitle')} : ${t(WALL_VIEW_LABELS[this._lowWalls.view])}`,
+        visible: () => !!this._plan,
+        active: () => this._lowWalls.view !== 'up',
+        onClick: (btn: HTMLButtonElement) => this._toggleWallMenu(btn),
+      },
+      { id: 'recenter', icon: 'target', label: () => t('uiRecenter'), onClick: () => this._frameModel(true) },
+      {
+        id: 'full', icon: 'full', label: () => (this._fsReasons.has('user') ? t('uiFullscreenExit') : t('uiFullscreen')),
+        active: () => this._fsReasons.has('user'),
+        onClick: () => this._setFullscreen('user', !this._fsReasons.has('user')),
+      },
+      {
+        id: 'lock', icon: 'unlock', label: () => (this._locked ? t('viewUnlock') : t('viewLock')),
+        visible: () => ui().show_lock !== false,
+        alert: () => this._locked,
+        onClick: () => this._toggleLock(),
+      },
+      { id: 'help', icon: 'help', label: () => t('uiHelp'), sepBefore: true, onClick: () => this._startViewTour() },
+      {
+        id: 'custom', icon: 'brush', label: () => t('uiCustomize'),
+        active: () => !!this._ui?.customizing,
+        onClick: () => { this._closeWallMenu(); this._ui?.toggleSheet(); },
+      },
+      {
+        id: 'edit', icon: 'pencil', label: () => t('editAnchorsTitle'),
+        visible: () => ui().show_editor !== false,
+        onClick: () => { this._closeWallMenu(); this._ui?.closeSheet(); this._requestEdit(); },
+      },
+    ].map((b) => {
+      // Icônes personnalisées : un texte à la place du dessin.
+      const text = b.id === 'edit' ? custom().editor : b.id === 'lock' ? (this._locked ? custom().lock_closed : custom().lock_open) : undefined;
+      return text ? { ...b, get text() { return text; } } as DockButton : b as DockButton;
+    });
+  }
+
+  /**
+   * Les premiers pas, lus sur la scène : une maison (plan ou modèle importé),
+   * un appareil relié, une porte reliée (s'il y a des ouvrants), une vue
+   * enregistrée, une carte personnalisée.
+   */
+  private _setupSteps(): import('./card/edit-panel').SetupStep[] {
+    const sc = this._scene;
+    const anchors = this._editor ? [...this._editor.anchors.values()] : [];
+    const parts = sc?.parts ?? [];
+    const steps: import('./card/edit-panel').SetupStep[] = [
+      { id: 'plan', done: !this._isDemo },
+      { id: 'device', done: anchors.some((a) => !!a.entity) },
+    ];
+    if (parts.length) steps.push({ id: 'opening', done: parts.some((p) => !!p.entity) });
+    steps.push(
+      { id: 'view', done: (sc?.camera_views ?? []).length > 0 },
+      { id: 'custom', done: !!sc?.settings?.ui },
+    );
+    return steps;
+  }
+
+  /**
+   * Pose les appareils de chaque pièce de Home Assistant dans la pièce du plan
+   * du même nom, répartis dans son contour : les lampes près du plafond, les
+   * capteurs à hauteur d'yeux. Ce qui est déjà posé n'est pas reposé.
+   */
+  private async _autoPlace() {
+    const plan = this._plan;
+    const hass = this._hass;
+    const editor = this._editor;
+    if (!plan || !hass || !editor) return;
+    const reg = await loadRegistry(hass).catch(() => cachedRegistry());
+    const rooms = this._rooms();
+    // Le nom de la pièce HA, ou l'un de ses alias.
+    const matches = matchRooms(rooms, [...reg.areas.values()].flatMap((a) => [a.name, ...(a.aliases ?? [])].map((name) => ({ id: a.area_id, name }))));
+    if (!matches.size) { this._showToast(t('autoPlaceNoMatch'), true); return; }
+    const placed = new Set([...editor.anchors.values()].map((a) => a.entity).filter(Boolean));
+    const origin = this._planOrigin(plan);
+    // Le sol et la hauteur sous plafond de l'étage montré : ses pièces seules sont proposées.
+    const floor = this._groundY + this._floorLift();
+    const ceiling = floor + ((this._activeDoc() ?? plan).wallHeight ?? 2.5) - 0.35;
+    const eye = floor + 1.4;
+    const add: { entity: string; label: string; position: THREE.Vector3 }[] = [];
+    let roomsUsed = 0;
+    for (const room of rooms) {
+      const areaId = matches.get(room.id);
+      if (!areaId) continue;
+      // Ni réglages d'une intégration (appareil « service »), ni doublons
+      // d'un même appareil vu par deux intégrations.
+      const ids = onePerDevice(Object.keys(hass.states).filter((id) =>
+        !placed.has(id) && !isTechnical(reg, id) && areaOf(reg, id)?.area_id === areaId
+        && !deviceOf(reg, id)?.service
+        && placeable(id, hass.states[id]?.attributes ?? {})),
+      (id) => deviceOf(reg, id)?.id, (id) => hass.states[id]?.attributes?.device_class);
+      if (!ids.length) continue;
+      roomsUsed++;
+      const pts = spreadPoints(room.poly, ids.length);
+      ids.forEach((id, i) => {
+        const p = pts[i];
+        const y = id.startsWith('light.') ? ceiling : eye;
+        add.push({ entity: id, label: displayName(reg, hass, id), position: new THREE.Vector3(p.x - origin.x, y, p.y - origin.y) });
+        placed.add(id);
+      });
+    }
+    if (!add.length) { this._showToast(t('autoPlaceNothing'), true); return; }
+    editor.addMany(add);
+    this._editPanel?.updateAnchorList();
+    this._showToast(t('autoPlaceDone').replace('{n}', String(add.length)).replace('{rooms}', String(roomsUsed)));
+  }
+
+  // ── Étages ──────────────────────────────────────────────────────────────
+
+  /** L'étage montré (0 : le rez-de-chaussée), retenu par appareil et par scène. */
+  private _activeFloor = 0;
+  /** Le groupe 3D de l'étage montré, après chaque construction. */
+  private _activeGroup: THREE.Object3D | null = null;
+  private get _floorKey() { return `houscape_floor_${this._getActiveSceneId() ?? ''}`; }
+
+  private _restoreFloor() {
+    try { this._activeFloor = Math.max(0, Number(localStorage.getItem(this._floorKey) ?? 0) || 0); } catch { this._activeFloor = 0; }
+  }
+
+  /** Les niveaux du logement (un seul pour une maison de plain-pied). */
+  private _floors(): FloorView[] {
+    const p = this._plan;
+    return p ? floorViews(p, t('floorGround')) : [];
+  }
+
+  /** L'étage montré, borné aux étages qui existent. */
+  private _floorIndex(): number {
+    return Math.min(this._activeFloor, Math.max(0, this._floors().length - 1));
+  }
+
+  /** Le plan de l'étage montré. */
+  private _activeDoc(): PlanDoc | null {
+    const p = this._plan;
+    return p ? floorDoc(p, this._floorIndex()) : null;
+  }
+
+  /** Hauteur du sol de l'étage montré au-dessus du rez-de-chaussée. */
+  private _floorLift(): number {
+    return this._floors()[this._floorIndex()]?.elevation ?? 0;
+  }
+
+  /** Le sol du rez-de-chaussée, dans la scène. */
+  private get _groundY(): number {
+    return this._modelBox.min.y + 0.02;
+  }
+
+  /** Les hauteurs de sol des niveaux, recalculées seulement quand le plan change. */
+  private _levelsCache: { plan: PlanDoc; tops: number[] } | null = null;
+
+  /**
+   * L'étage d'un point de la scène. Appelé pour chaque pastille à chaque
+   * image : les hauteurs des niveaux sont gardées, pas recalculées.
+   */
+  private _floorOfY(y: number): number {
+    const p = this._plan;
+    if (!p?.floors?.length) return 0;
+    if (this._levelsCache?.plan !== p) this._levelsCache = { plan: p, tops: floorViews(p).map((v) => v.elevation) };
+    const h = y - this._groundY;
+    let k = 0;
+    this._levelsCache.tops.forEach((e, i) => { if (h >= e - 0.1) k = i; });
+    return k;
+  }
+
+  /** Après une construction : le groupe de l'étage montré, l'éclairage des étages, le toit. */
+  private _refreshFloorGroup(root: THREE.Object3D) {
+    const plan = this._plan;
+    this._activeGroup = plan ? floorGroup(root, plan, this._floorIndex()) ?? root : root;
+    this._applyFloorLights();
+    this._syncRoof();
+  }
+
+  /**
+   * Le toit en pente (réglage) : sur le dernier niveau, quand c'est lui qu'on
+   * regarde. Il ne se montre que murs debout, hors édition : c'est la vue de
+   * l'extérieur, les autres vues servent à voir dedans.
+   */
+  private _syncRoof() {
+    const root = this._modelRoot;
+    if (!root) return;
+    const old = root.getObjectByName(ROOF_NAME);
+    if (old) {
+      old.removeFromParent();
+      // Maillage et trait des arêtes : tout ce qui porte une géométrie.
+      old.traverse((o) => {
+        const m = o as THREE.Mesh;
+        if (!m.geometry) return;
+        m.geometry.dispose();
+        (Array.isArray(m.material) ? m.material : [m.material]).forEach((x) => x?.dispose());
+      });
+    }
+    const plan = this._plan;
+    const want = this._roofKind() === 'hip';
+    if (plan && want && this._floorIndex() === this._floors().length - 1) {
+      const doc = this._activeDoc() ?? plan;
+      const cover = plan.roof ? plan.roofColor ?? 'tile' : this._effectiveConfig?.rendering?.roof_color ?? 'tile';
+      const roof = buildRoof(doc, ROOF_COLORS[cover] ?? ROOF_COLORS.tile);
+      if (roof) {
+        // Construit caché : `_updateRoofVisibility` le montre si la vue s'y prête.
+        roof.visible = false;
+        roof.traverse((o) => o.layers.disableAll());
+        (this._activeGroup ?? root).add(roof);
+      }
+    }
+    this._updateRoofVisibility();
+  }
+
+  /** Le toit se règle sur le plan ; l'ancien réglage de scène vaut tant que le plan n'en dit rien. */
+  private _roofKind(): 'flat' | 'hip' {
+    return this._plan?.roof ?? this._effectiveConfig?.rendering?.roof ?? 'flat';
+  }
+
+  private _updateRoofVisibility() {
+    const roof = this._modelRoot?.getObjectByName(ROOF_NAME);
+    if (!roof) return;
+    const show = this._lowWalls.view === 'up' && !this._editMode && !this._planEditor;
+    if (roof.visible === show) return;
+    roof.visible = show;
+    // Caché, il ne doit pas non plus arrêter les clics : le lancer de rayon de
+    // three.js touche les objets invisibles, pas ceux hors de ses calques.
+    roof.traverse((o) => { if (show) o.layers.set(0); else o.layers.disableAll(); });
+    this._requestShadowUpdate();
+    this._requestRender();
+  }
+
+  /**
+   * Les lampes d'un étage masqué s'éteignent (par leur intensité, voir
+   * stepTransitions) ; et seules les premières, dans la limite du profil
+   * qualité, éclairent vraiment la scène. Leur nombre ne change plus jamais
+   * en cours de route : pas de recompilation des shaders.
+   */
+  private _applyFloorLights() {
+    const k = this._floorIndex();
+    // Les lampes de l'étage regardé d'abord : ce sont elles qu'on voit.
+    const lamps = [...this.anchors.values()].filter((a) => a.light);
+    lamps.sort((a, b) => Number(this._floorOfY(a.worldPos.y) !== k) - Number(this._floorOfY(b.worldPos.y) !== k));
+    const budget = this._quality.anchorLights;
+    lamps.forEach((a, i) => {
+      const light = a.light!;
+      light.userData.houscapeFloorOff = this._floorOfY(a.worldPos.y) > k;
+      light.userData.houscapeReal = i < budget;
+      light.visible = i < budget;
+    });
+    this._dirty = true;
+  }
+
+  /** L'étage d'un ouvrant construit depuis le plan (`null` pour un ouvrant d'un modèle importé). */
+  private _partFloorIndex(part: HouscapePart): number | null {
+    const plan = this._plan;
+    if (!plan || !part.node?.startsWith('plan_leaf_')) return null;
+    const rest = part.node.slice('plan_leaf_'.length);
+    const opening = rest.slice(0, rest.lastIndexOf('_'));
+    const v = floorViews(plan).find((f) => f.doc.openings.some((o) => o.id === opening));
+    return v ? v.index : null;
+  }
+
+  /** Change d'étage : la maison se reconstruit jusqu'à lui, la caméra monte ou descend avec. */
+  private _setFloor(index: number) {
+    const plan = this._plan;
+    if (!plan || !this._scene) return;
+    const before = this._floorLift();
+    this._activeFloor = Math.max(0, Math.min(index, this._floors().length - 1));
+    try { localStorage.setItem(this._floorKey, String(this._activeFloor)); } catch { /* stockage bloqué */ }
+    this._ui?.setActiveRoom(null);
+    this._roomsCache = null;
+    this.applyPlan(this._scene.plan!);
+    this._compileInBackground();
+    const dy = this._floorLift() - before;
+    if (dy && this.camera && this.controls) {
+      this._camAnimTo = {
+        pos: this.camera.position.clone().add(new THREE.Vector3(0, dy, 0)),
+        target: this.controls.target.clone().add(new THREE.Vector3(0, dy, 0)),
+      };
+    }
+    this._ui?.refreshFloors();
+    this._ui?.refreshRooms();
+    if (this._editor && this._editMode) {
+      this._editor.setMarkerFilter((p) => this._floorOfY(p.y) === this._floorIndex());
+      // Les étiquettes d'étage des listes changent avec l'étage regardé.
+      this._editPanel?.updateAnchorList();
+      this._editPanel?.refreshPartsList();
+      this._editPanel?.refreshFloors();
+    }
+    this._requestShadowUpdate();
+    this._requestRender();
+  }
+
+  // ── La maison habitée, le soir ──────────────────────────────────────────
+
+  private _glowKey = '';
+
+  /**
+   * La nuit, les vitres d'une pièce dont une lampe est allumée prennent une
+   * lueur chaude : de dehors, on voit que la maison vit. Ne retouche les
+   * vitres que si quelque chose a changé (nuit, lampes, maison reconstruite).
+   */
+  private _updateWindowGlow() {
+    const root = this._modelRoot, plan = this._plan, hass = this._hass;
+    if (!root || !plan) return;
+    const night = !!this._env?.isNight;
+    const lit = new Set<string>();
+    if (night && hass) {
+      const origin = this._planOrigin(plan);
+      const roomsOf = new Map<number, RoomView[]>();
+      this.anchors.forEach((a) => {
+        if (a.domain !== 'light' || hass.states[a.entityId]?.state !== 'on') return;
+        const k = this._floorOfY(a.worldPos.y);
+        if (!roomsOf.has(k)) roomsOf.set(k, planRooms(floorDoc(plan, k)));
+        const r = roomOfPoint(roomsOf.get(k)!, origin, a.worldPos.x, a.worldPos.z);
+        if (r) lit.add(`${k}:${r.id}`);
+      });
+    }
+    const key = `${root.uuid}|${root.children.length}|${night}|${[...lit].sort().join(',')}`;
+    if (key === this._glowKey) return;
+    this._glowKey = key;
+    root.traverse((o) => {
+      if (!o.name.startsWith('plan_opening_')) return;
+      let floor = 0;
+      for (let q: THREE.Object3D | null = o; q && q !== root; q = q.parent) {
+        if (typeof q.userData.houscapeFloor === 'number') { floor = q.userData.houscapeFloor; break; }
+      }
+      const ids = (o.userData.houscapeRooms as string[] | undefined) ?? [];
+      const on = night && ids.some((id) => lit.has(`${floor}:${id}`));
+      o.traverse((m) => {
+        const mesh = m as THREE.Mesh;
+        if (!mesh.isMesh || !mesh.name.endsWith('_pane')) return;
+        if (!mesh.userData.houscapeGlass) mesh.userData.houscapeGlass = mesh.material;
+        mesh.material = on ? litGlass() : mesh.userData.houscapeGlass;
+      });
+    });
+    this._requestRender();
+  }
+
+  /** Les pièces de l'étage montré, recalculées seulement quand son plan change. */
+  private _roomsCache: { plan: PlanDoc; rooms: RoomView[] } | null = null;
+  private _rooms(): RoomView[] {
+    const plan = this._activeDoc();
+    if (!plan) return [];
+    if (this._roomsCache?.plan !== plan) this._roomsCache = { plan, rooms: planRooms(plan) };
+    return this._roomsCache.rooms;
+  }
+
+  /** Le module « Pièces » : chaque pièce du plan, avec ses lampes allumées. */
+  private _hudRooms(): HudRoom[] {
+    const plan = this._plan;
+    if (!plan || !this.modelLoaded) return [];
+    const rooms = this._rooms();
+    const origin = this._planOrigin(plan);
+    const lit = new Map<string, number>();
+    const hass = this._hass;
+    const k = this._floorIndex();
+    if (hass) {
+      this.anchors.forEach((a) => {
+        if (a.domain !== 'light' || hass.states[a.entityId]?.state !== 'on' || this._floorOfY(a.worldPos.y) !== k) return;
+        const r = roomOfPoint(rooms, origin, a.worldPos.x, a.worldPos.z);
+        if (r) lit.set(r.id, (lit.get(r.id) ?? 0) + 1);
+      });
+    }
+    // Température d'une pièce : la moyenne des capteurs de température qui y sont posés.
+    const temps = new Map<string, number[]>();
+    // Les décimales que HA montre pour ces capteurs : la moyenne s'affiche pareil.
+    const places = new Map<string, number>();
+    if (hass) {
+      this.anchors.forEach((a) => {
+        if (a.domain !== 'sensor' || this._floorOfY(a.worldPos.y) !== k) return;
+        const st = hass.states[a.entityId];
+        const v = Number(st?.state);
+        const unit = String(st?.attributes?.unit_of_measurement ?? '');
+        if (!Number.isFinite(v) || (st?.attributes?.device_class !== 'temperature' && !unit.includes('°'))) return;
+        const r = roomOfPoint(rooms, origin, a.worldPos.x, a.worldPos.z);
+        if (!r) return;
+        temps.set(r.id, [...(temps.get(r.id) ?? []), v]);
+        const p = a.precision ?? haPrecision(hass, a.entityId) ?? 1;
+        places.set(r.id, Math.max(places.get(r.id) ?? 0, p));
+      });
+    }
+    const fmt = (vs: number[], p: number) => {
+      const avg = vs.reduce((s, v) => s + v, 0) / vs.length;
+      return `${formatSensor(String(avg), getLang(), p)}°`;
+    };
+    return rooms.map((r) => ({
+      id: r.id, name: r.name, lit: lit.get(r.id) ?? 0,
+      ...(temps.has(r.id) ? { temp: fmt(temps.get(r.id)!, places.get(r.id) ?? 1) } : {}),
+    }));
+  }
+
+  /** Les appareils posés dans une pièce : ceux dont la pastille tombe dans son contour. */
+  private _roomDevices(roomId: string): HudDevice[] {
+    const plan = this._plan;
+    const hass = this._hass;
+    if (!plan || !hass) return [];
+    const rooms = this._rooms();
+    const origin = this._planOrigin(plan);
+    const out: HudDevice[] = [];
+    this.anchors.forEach((a) => {
+      if (!a.entityId || (a.kind ?? 'entity') !== 'entity' || a.hidden) return;
+      if (this._floorOfY(a.worldPos.y) !== this._floorIndex()) return;
+      if (roomOfPoint(rooms, origin, a.worldPos.x, a.worldPos.z)?.id !== roomId) return;
+      const st = hass.states[a.entityId];
+      const desc = describeEntity(a.entityId);
+      const toggle = (a.tapAction && a.tapAction !== 'default' ? a.tapAction : desc.tap) === 'toggle';
+      // Un capteur n'est pas « allumé » : seule une commande ou une alerte se colore.
+      const on = desc.isOn(st) && (toggle || a.domain === 'binary_sensor');
+      let state = desc.stateText(st);
+      const unit = st?.attributes?.unit_of_measurement;
+      if (typeof unit === 'string' && unit && /^-?[\d.,]+$/.test(state)) {
+        state = `${_formatSensorValue(state, a.precision, a.entityId, this._hass)} ${unit}`;
+      }
+      out.push({ id: a.entityId, name: a.label || a.entityId, state, on, icon: entityIconName(a.entityId, undefined, st?.attributes ?? {}), toggle, attributes: st?.attributes ?? {} });
+    });
+    // Ce qui se commande d'abord, puis par nom.
+    return out.sort((x, y) => Number(y.toggle) - Number(x.toggle) || x.name.localeCompare(y.name));
+  }
+
+  /** « Tout éteindre » dans une pièce : les lampes allumées qui y sont posées. */
+  private _roomAllOff(roomId: string) {
+    const hass = this._hass;
+    if (!hass) return;
+    const on = this._roomDevices(roomId).filter((d) => d.on && d.id.startsWith('light.')).map((d) => d.id);
+    if (on.length) hass.callService('light', 'turn_off', { entity_id: on });
+  }
+
+  /**
+   * Deux touches rapprochées dans la 3D : la caméra va dans la pièce touchée.
+   * Sur la pièce déjà montrée, ou hors de la maison, elle revient à toute la
+   * maison. La pièce se trouve en coupant le rayon de la caméra avec le sol :
+   * pas de lancer de rayon sur les objets, rien à charger.
+   */
+  private _lastFloorTap = { t: 0, x: 0, y: 0 };
+  private _floorDoubleTap(e: PointerEvent): boolean {
+    const plan = this._plan;
+    if (!plan || !this.camera || !this.canvas) return false;
+    const prev = this._lastFloorTap;
+    const dbl = e.timeStamp - prev.t < 380 && Math.hypot(e.clientX - prev.x, e.clientY - prev.y) < 30;
+    this._lastFloorTap = dbl ? { t: 0, x: 0, y: 0 } : { t: e.timeStamp, x: e.clientX, y: e.clientY };
+    if (!dbl) return false;
+    const rect = this.canvas.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      -((e.clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(ndc, this.camera);
+    const floor = new THREE.Plane(new THREE.Vector3(0, 1, 0), -(this._groundY + this._floorLift()));
+    const hit = new THREE.Vector3();
+    const room = ray.ray.intersectPlane(floor, hit)
+      ? roomOfPoint(this._rooms(), this._planOrigin(plan), hit.x, hit.z)
+      : null;
+    const target = room && room.id !== this._ui?.activeRoomId ? room.id : null;
+    this._ui?.setActiveView(null);
+    this._ui?.setActiveRoom(target);
+    this._flyToRoom(target);
+    return true;
+  }
+
+  /** La caméra vole au-dessus d'une pièce ; `null` revient à toute la maison. */
+  private _flyToRoom(id: string | null) {
+    if (!id) { this._frameModel(true); return; }
+    const plan = this._plan;
+    const room = this._rooms().find((r) => r.id === id);
+    if (!plan || !room || !this.camera) return;
+    const visible = this.canvas?.clientWidth ? 1 - Math.abs(this._viewShift) / this.canvas.clientWidth : 1;
+    const doc = this._activeDoc() ?? plan;
+    const pose = roomCamera(room, this._planOrigin(plan), {
+      fovDeg: this.camera.fov, aspect: this.camera.aspect, wallHeight: doc.wallHeight ?? 2.5, visible,
+      // Le centre du rez-de-chaussée est à mi-hauteur de ses murs (y = 0) : les étages s'y ajoutent.
+      lift: this._floorLift(),
+    });
+    this._camAnimTo = { pos: new THREE.Vector3(...pose.pos), target: new THREE.Vector3(...pose.target) };
+    this._requestRender();
+  }
+
+  /** L'état de la maison pour le module « État » : lampes allumées, météo. */
+  private _homeStatus(): HudStatus | null {
+    const hass = this._hass;
+    if (!hass || !this.modelLoaded) return null;
+    let lightsOn = 0;
+    this.anchors.forEach((a) => { if (a.domain === 'light' && hass.states[a.entityId]?.state === 'on') lightsOn++; });
+    const out: HudStatus = { lightsOn };
+    const id = this._effectiveConfig.weather_entity;
+    const w = id ? hass.states[id] : undefined;
+    if (w) {
+      const temp = Number(w.attributes?.temperature);
+      const unit = String(w.attributes?.temperature_unit ?? '°');
+      if (Number.isFinite(temp)) out.temp = `${Math.round(temp)}${unit.startsWith('°') ? '°' : ` ${unit}`}`;
+      const key = WEATHER_LABEL[w.state];
+      if (key) out.weather = t(key);
+    }
+    return out;
+  }
+
+  /** Les préférences d'affichage partent avec la scène, un peu après le dernier changement. */
+  private _saveUiPrefs(prefs: UiPrefs) {
+    const sceneId = this._getActiveSceneId();
+    if (!this._scene && sceneId) this._scene = emptyScene(sceneId);
+    if (!this._scene) return;
+    this._scene = { ...this._scene, settings: { ...this._scene.settings, ui: JSON.parse(JSON.stringify(prefs)) } };
+    if (this._uiSaveTimer) clearTimeout(this._uiSaveTimer);
+    this._uiSaveTimer = setTimeout(() => {
+      this._uiSaveTimer = null;
+      if (!sceneId || !this._hass || !this._scene || this._backendDown) return;
+      saveScene(this._hass, sceneId, this._scene).catch(() => this._showToast(t('toastSceneSaveError'), true));
+    }, 700);
+  }
+
+  /** La visite de la carte, hors édition. */
+  private _startViewTour() {
+    if (!this._tour) return;
+    markTourSeen();
+    this._ui?.hideHello();
+    this._ui?.closeSheet();
+    this._closeWallMenu();
+    this._showControls();
+    const dock = (id: string) => () => this._ui?.dockButton(id);
+    const steps: TourStep[] = [
+      { title: 'tourHomeTitle', text: 'tourHomeText', anim: 'orbit' },
+    ];
+    if (this.overlays.size) steps.push({ target: () => [...this.overlays.values()].find((o) => o.el.offsetParent && o.el.style.display !== 'none')?.el, title: 'tourTapTitle', text: 'tourTapText', anim: 'tap' });
+    if (this._ui?.roomsModule) steps.push({ target: () => this._ui?.roomsModule, title: 'tourRoomsTitle', text: 'tourRoomsText', anim: 'views' });
+    if (this._plan) steps.push({ target: dock('walls'), title: 'tourWallsTitle', text: 'tourWallsText', anim: 'walls' });
+    steps.push(
+      { target: dock('full'), title: 'tourFullTitle', text: 'tourFullText', anim: 'full' },
+      { target: dock('custom'), title: 'tourCustomTitle', text: 'tourCustomText', anim: 'layout' },
+    );
+    if (this._config?.ui?.show_editor !== false) steps.push({ target: dock('edit'), title: 'tourEditTitle', text: 'tourEditText', anim: 'add' });
+    this._ui?.setIdle(false);
+    this._tour.start(steps, () => this._showControlsTemporarily());
+  }
+
+  private _wallMenu: HTMLDivElement | null = null;
+
+  /** Le menu des vues des murs, à côté du bouton : debout, coupés, fantômes, bas. */
+  private _toggleWallMenu(btn: HTMLButtonElement) {
+    if (this._wallMenu) { this._closeWallMenu(); return; }
+    const host = this.overlayContainer;
+    if (!host) return;
+    const menu = document.createElement('div');
+    menu.className = 'ow-surface ow-menu';
+    menu.setAttribute('role', 'menu');
+    const title = document.createElement('div');
+    title.className = 'ow-menu-title';
+    title.textContent = t('wallViewTitle');
+    menu.appendChild(title);
+    for (const view of WALL_VIEWS) {
+      const on = view === this._lowWalls.view;
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = `ow-menu-item${on ? ' ow-on' : ''}`;
+      item.setAttribute('role', 'menuitemradio');
+      item.setAttribute('aria-checked', String(on));
+      const text = document.createElement('span');
+      const label = document.createElement('strong');
+      label.textContent = t(WALL_VIEW_LABELS[view]);
+      const hint = document.createElement('small');
+      // Le toit en pente se montre murs debout : on le dit là.
+      const roofed = view === 'up' && !!this._plan && this._roofKind() === 'hip';
+      hint.textContent = t(roofed ? 'wallViewUpRoofHint' : WALL_VIEW_HINTS[view]);
+      text.append(label, hint);
+      item.append(uiIcon(WALL_VIEW_ICONS[view], 20), text);
+      item.addEventListener('click', (e) => { e.stopPropagation(); this._closeWallMenu(); this._setWallView(view); });
+      menu.appendChild(item);
+    }
+    host.appendChild(menu);
+    placePopover(menu, btn, host);
+    this._wallMenu = menu;
+    // Un clic ailleurs le referme.
+    setTimeout(() => document.addEventListener('pointerdown', this._onWallMenuOutside, true), 0);
+  }
+
+  private _onWallMenuOutside = (e: PointerEvent) => {
+    if (this._wallMenu && !e.composedPath().includes(this._wallMenu)) this._closeWallMenu();
+  };
+
+  private _closeWallMenu() {
+    document.removeEventListener('pointerdown', this._onWallMenuOutside, true);
+    this._wallMenu?.remove();
+    this._wallMenu = null;
+  }
+
+  /**
+   * Change la vue des murs. Les meubles accrochés reçoivent le numéro de leur
+   * mur : le regroupement est refait quand une vue coupante s'allume ou
+   * s'éteint (pas entre deux vues coupantes).
+   */
+  private _setWallView(view: WallView) {
+    const was = this._lowWalls.enabled;
+    this._lowWalls.setView(view, this._modelRoot);
+    try { localStorage.setItem(LOW_WALLS_KEY, String(WALL_VIEWS.indexOf(view))); } catch { /* stockage bloqué */ }
+    const root = this._modelRoot, plan = this._plan;
+    if (root && plan && was !== this._lowWalls.enabled) {
+      this._batch?.unmerge();
+      root.traverse((o) => { if (o.name.startsWith('plan_item_')) { delete o.userData.houscapeWallItem; o.visible = true; } });
+      if (!this._lowWalls.enabled) this._lowWalls.reset();
+      this._lowWalls.attachItems(this._activeDoc() ?? plan, this._activeGroup ?? root);
+      this._mergeStatic();
+    }
+    this._paintLowWallsBtn();
+    this._updateRoofVisibility();
+    this._requestShadowUpdate();
+    this._requestRender();
+  }
+
+
+  // ── Controls visibility ────────────────────────────────────────────────
+
+  private _showControls() {
+    this._ui?.setIdle(false);
+    if (!this._hud) return;
+    this._hud.style.opacity = '1';
+    this._hud.style.pointerEvents = 'auto';
+    if (this._hudViews) { this._hudViews.style.opacity = '1'; this._hudViews.style.pointerEvents = 'auto'; }
+  }
+
+  private _hideControls() {
+    if (this._editMode) return;
+    if (this._sim?.isOpen) return; // keep visible while sim panel is open
+    if (this._ui?.customizing || this._wallMenu) return;
+    this._ui?.setIdle(true);
+    if (!this._hud) return;
+    this._hud.style.opacity = '0';
+    this._hud.style.pointerEvents = 'none';
+    if (this._hudViews) { this._hudViews.style.opacity = '0'; this._hudViews.style.pointerEvents = 'none'; }
+  }
+
+  private _showControlsTemporarily() {
+    this._showControls();
+    if (this._controlsHideTimer) clearTimeout(this._controlsHideTimer);
+    this._controlsHideTimer = setTimeout(() => this._hideControls(), 4000);
+  }
+
+  // ── Overlay toggle ─────────────────────────────────────────────────────
+
+  private _overlayHideBadge: HTMLDivElement | null = null;
+
+  private _toggleOverlays() {
+    this._overlaysVisible = !this._overlaysVisible;
+    this.overlays.forEach((o) => {
+      o.el.style.display = this._overlaysVisible ? '' : 'none';
+    });
+    this._clusters.forEach((c) => {
+      if (!this._overlaysVisible) c.hide();
+    });
+    this._syncOverlayHideBadge();
+  }
+
+  private _syncOverlayHideBadge() {
+    if (!this.overlayContainer) return;
+    if (this._overlaysVisible) {
+      if (this._overlayHideBadge) {
+        this._overlayHideBadge.style.opacity = '0';
+        setTimeout(() => { this._overlayHideBadge?.remove(); this._overlayHideBadge = null; }, 250);
+      }
+      return;
+    }
+    if (!this._overlayHideBadge) {
+      const badge = document.createElement('div');
+      badge.style.cssText = [
+        'position:absolute', 'top:10px', 'left:50%', 'transform:translateX(-50%)',
+        'background:rgba(0,0,0,0.72)', 'backdrop-filter:blur(8px)',
+        'border:1px solid rgba(255,255,255,0.15)', 'border-radius:20px',
+        'color:rgba(255,255,255,0.7)', 'font-size:11px',
+        'font-family:var(--primary-font-family,sans-serif)',
+        'padding:4px 12px', 'pointer-events:none', 'z-index:20',
+        'display:flex', 'align-items:center', 'gap:5px',
+        'opacity:0', 'transition:opacity .2s ease',
+        'white-space:nowrap',
+      ].join(';');
+      badge.append(uiIcon('eyeOff', 14), document.createTextNode(t('overlaysHidden')));
+      this.overlayContainer.appendChild(badge);
+      this._overlayHideBadge = badge;
+      requestAnimationFrame(() => { badge.style.opacity = '1'; });
+    }
+  }
+
+  private _toggleLock(force?: boolean) {
+    this._locked = force !== undefined ? force : !this._locked;
+    if (this.controls) this.controls.enabled = !this._locked && !this._editMode;
+    this._ui?.refreshDock();
+    this._saveView();
+  }
+
+  // ── Edit mode ─────────────────────────────────────────────────────────
+
+  private _toggleEditMode() {
+    if (!this.modelLoaded || !this._modelRoot) return;
+    this._editMode ? this._exitEditMode() : this._enterEditMode();
+  }
+
+  /**
+   * « Modifier » : sur une petite carte, l'éditeur est à l'étroit. On propose
+   * d'abord le plein écran, sauf si l'utilisateur a dit de ne plus demander.
+   */
+  private _requestEdit(tab?: string) {
+    if (!this.modelLoaded || !this._modelRoot) return;
+    if (this._editMode) { this._exitEditMode(); return; }
+    this._ui?.hideHello();
+    const w = this._haCard?.offsetWidth ?? 0;
+    let never = false;
+    try { never = localStorage.getItem(FULL_ASK_KEY) === 'never'; } catch { /* stockage bloqué */ }
+    if (this._fullscreenHost || w >= 900) { this._enterEditMode(tab); return; }
+    if (never) { this._setFullscreen('edit', localStorage.getItem(FULL_ASK_CHOICE) !== 'here'); this._enterEditMode(tab); return; }
+    this._askFullscreen((full, remember) => {
+      if (remember) {
+        try { localStorage.setItem(FULL_ASK_KEY, 'never'); localStorage.setItem(FULL_ASK_CHOICE, full ? 'full' : 'here'); } catch { /* stockage bloqué */ }
+      }
+      if (full) this._setFullscreen('edit', true);
+      this._enterEditMode(tab);
+    });
+  }
+
+  private _askFullscreen(done: (full: boolean, remember: boolean) => void) {
+    const host = this.overlayContainer;
+    if (!host || host.querySelector('.ow-scrim')) return;
+    const scrim = document.createElement('div');
+    scrim.className = 'ow-scrim ow-ui';
+    scrim.innerHTML = `<div class="ow-surface ow-dialog" role="dialog" aria-modal="true" aria-labelledby="ow-ask-t">
+      <div style="height:70px;border-radius:10px;background:var(--ow-chrome2);position:relative;overflow:hidden"><div class="ow-ask-grow"></div></div>
+      <h4 id="ow-ask-t">${t('uiAskFullTitle')}</h4>
+      <p>${t('uiAskFullText')}</p>
+      <div class="ow-row"><button type="button" class="ow-btn ow-primary" data-a="full"></button><button type="button" class="ow-btn ow-ghost" data-a="here">${t('uiAskFullHere')}</button></div>
+      <label><input type="checkbox" data-a="never"> ${t('uiAskFullNever')}</label></div>`;
+    const full = scrim.querySelector('[data-a="full"]') as HTMLButtonElement;
+    full.append(uiIcon('full', 16), document.createTextNode(t('uiAskFullGo')));
+    const close = (choice: boolean | null) => {
+      const remember = (scrim.querySelector('[data-a="never"]') as HTMLInputElement).checked;
+      scrim.remove();
+      window.removeEventListener('keydown', onKey, true);
+      if (choice !== null) done(choice, remember);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.stopPropagation(); close(null); } };
+    window.addEventListener('keydown', onKey, true);
+    scrim.addEventListener('pointerdown', (e) => e.stopPropagation());
+    scrim.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const a = (e.target as HTMLElement).closest('[data-a]')?.getAttribute('data-a');
+      if (e.target === scrim) close(null);
+      else if (a === 'full') close(true);
+      else if (a === 'here') close(false);
+    });
+    host.appendChild(scrim);
+    full.focus();
+  }
+
+  private _enterEditMode(tab?: string) {
+    queueMicrotask(() => this._updateRoofVisibility());
+    // Les marqueurs et gizmos de l'éditeur modifient la géométrie de la scène.
+    this._requestShadowUpdate();
+    this._editMode = true;
+    // L'éditeur clique, survole et désigne les objets d'origine.
+    this._batch?.unmerge();
+    this._closeWallMenu();
+    this._tour?.end();
+    this._ui?.setHidden(true);
+    const welcome = this.overlayContainer?.querySelector<HTMLElement>('#houscape-demo-banner');
+    if (welcome) welcome.style.display = 'none';
+    // Reposition HUD to center + restore bar glassmorphism for edit toolbar
+    if (this._hud) {
+      this._hud.style.bottom = '12px';
+      this._hud.style.right = 'auto';
+      this._hud.style.left = '50%';
+      this._hud.style.transform = 'translateX(-50%)';
+      this._hud.style.alignItems = 'stretch';
+    }
+    if (this._hudBar) {
+      this._hudBar.style.background = 'rgba(8,12,24,0.72)';
+      this._hudBar.style.backdropFilter = 'blur(12px)';
+      this._hudBar.style.setProperty('-webkit-backdrop-filter', 'blur(12px)');
+      this._hudBar.style.border = '1px solid rgba(255,255,255,0.1)';
+    }
+    // Hide view pill; move buttons back to _hudLeft for showToolbar() to use
+    if (this._hudViews && this._hudLeft) {
+      this._hudLeft.innerHTML = '';
+      Array.from(this._hudViews.children).forEach(b => this._hudLeft!.appendChild(b));
+      this._hudViews.style.display = 'none';
+      this._hudViews.style.opacity = '0';
+    }
+    this._showControls();
+
+    this.overlays.forEach((o) => { o.el.style.display = 'none'; });
+    this._clusters.forEach((c) => c.hide());
+
+    const editable = new Map<string, EditableAnchor>();
+    this.anchors.forEach((entry, key) => {
+      // ⚠ Recopie exhaustive obligatoire : ce qui manque ici est perdu à
+      // l'entrée en édition, puis écrasé dans la scène au prochain
+      // enregistrement. Tout nouveau champ d'ancre doit être ajouté ici, dans
+      // scene.ts (les deux sens) et dans model.ts (les deux fabriques).
+      editable.set(key, {
+        entity: entry.entityId,
+        position: entry.worldPos.clone(),
+        label: entry.label,
+        hidden: entry.hidden,
+        lightStyle: entry.lightStyle,
+        lightStyles: entry.lightStyles ? [...entry.lightStyles] : undefined,
+        lightIntensity: entry.lightIntensity,
+        lightDirection: entry.lightDirection,
+        castLight: entry.castLight,
+        lightMesh: entry.lightMesh,
+        lightMeshIndex: entry.lightMeshIndex,
+        lightTriangle: entry.lightTriangle,
+        lightMeshes: entry.lightMeshes?.map((h) => ({ ...h })),
+        emissiveLevel: entry.emissiveLevel,
+        linkEmissiveBrightness: entry.linkEmissiveBrightness,
+        attachLightToObject: entry.attachLightToObject,
+        lightColor: entry.lightColor,
+        lightColorTemp: entry.lightColorTemp,
+        visibleIf: entry.visibleIf,
+        precision: entry.precision,
+        icon: entry.icon,
+        color: entry.color,
+        tapAction: entry.tapAction,
+        kind: entry.kind,
+        actions: entry.actions,
+        navViewId: entry.navViewId,
+        size: entry.size,
+        display: entry.display,
+        planId: entry.planId,
+      });
+    });
+
+    if (!this._editor) {
+      this._editor = new AnchorEditor(
+        this.scene!,
+        this.camera!,
+        this.canvas!,
+        this._modelRoot!,
+        this.overlayContainer!,
+      );
+    }
+
+    // Close sim panel if open (it lives in Config tab in edit mode)
+    if (this._sim?.isOpen) this._sim.toggle();
+
+    // Instantiate EditPanel now (needs editor, hud refs, and card container)
+    const card = this.querySelector('ha-card') as HTMLElement;
+    this._editPanel = new EditPanel(
+      this.overlayContainer!,
+      this._hud!,
+      this._hudLeft!,
+      this._hudRight!,
+      this._hudSep!,
+      card,
+      () => this._editor,
+      () => this._hass,
+      () => this._config,
+      () => this._getActiveSceneId(),
+      () => this._saveScene(),
+      () => this._exitEditMode(),
+      () => this._syncEditorLightsToScene(),
+      () => this._requestRender(),
+      () => this._rebuildNormalHUD(),
+      () => this._scene?.cards ?? [],
+      async (cards) => this._saveCardsDirect(cards),
+      () => this._selectedCardId,
+      (id) => {
+        this._selectedCardId = id;
+        this._cardRenderer?.setSelectedId(id);
+      },
+      (type) => this._startCardPlacement(type),
+      () => this._scene?.rules ?? [],
+      async (rules) => this._saveRulesDirect(rules),
+      () => normalizeViews(this._scene?.camera_views ?? []),
+      () => this._sim,
+      () => this._viewMgr,
+      () => this._scene?.settings ?? {},
+      (s: import('./types').SceneSettings, reloadScene?: boolean) => {
+        if (!this._scene) this._scene = {
+          version: 1, scene_id: this._getActiveSceneId() ?? '',
+          model_url: this._config?.model_url ?? '',
+          anchors: [], camera_views: [], cards: [], rules: [], parts: [], effects: [],
+        };
+        // Le menu n'envoie que ce qui change : rendu et caméra se fusionnent
+        // avec l'existant (une copie entière, figée à l'ouverture du menu,
+        // annulait les réglages faits entre-temps).
+        const cur = this._scene.settings ?? {};
+        this._scene = {
+          ...this._scene,
+          settings: {
+            ...cur,
+            ...s,
+            ...(s.rendering ? { rendering: { ...(cur.rendering ?? {}), ...s.rendering } } : {}),
+            ...(s.orbit ? { orbit: { ...(cur.orbit ?? {}), ...s.orbit } } : {}),
+          },
+        };
+        if (s.language) {
+          this._langFromScene = true;
+          setLang(s.language);
+        }
+        if (reloadScene) {
+          // scene_id was changed — store in localStorage and fully reload
+          const newId = (s as Record<string, unknown>)['scene_id'] as string | undefined;
+          if (newId) {
+            this._setActiveSceneId(newId);
+            // Recharger, c'est relire le serveur, pas le repli gardé en mémoire.
+            forgetSceneFailure(newId);
+            this.overlayContainer?.querySelector('#houscape-backend-down')?.remove();
+            this._scene = null;
+            this._sceneLoading = false;
+            if (this._hass) {
+              this._fetchAndLoadScene(newId);
+            }
+          }
+          return; // skip live-apply & auto-save — scene will be fully reloaded
+        }
+        this._applySettingsLive();
+        this._editPanel?.scheduleAutoSave();
+        this._requestRender();
+      },
+      async () => {
+        if (!this._hass) return [];
+        return listScenes(this._hass).catch(() => []);
+      },
+      () => this._scene?.parts ?? [],
+      async (parts) => this._savePartsDirect(parts),
+      (onPicked, mode) => this._startPartPicking(onPicked, mode ?? 'part'),
+      (id, fraction) => { this._parts.preview(id, fraction); this._requestRender(); },
+      (cfg) => {
+        const applied = this._parts.configure(cfg);
+        // Un changement de cible remonte l'ouvrant : le surlignage doit
+        // suivre le nouvel objet.
+        if (applied) { this._applyHighlight(); this._requestRender(); }
+        return applied;
+      },
+      () => this._modelSpan,
+      () => (this._modelRoot ? stampOrder(this._modelRoot) : null),
+      (req) => { this._highlightReq = req; this._applyHighlight(); },
+      (id) => this._parts.carried.get(id)?.length ?? 0,
+      (id) => this._parts.extendInfo(id),
+      () => clipInfos(this._modelRoot?.animations ?? []),
+      () => this._scene?.effects ?? [],
+      async (effects) => this._saveEffectsDirect(effects),
+      (cfg) => {
+        const applied = this._effects.configure(cfg);
+        if (applied) {
+          // Hors aperçu éditeur : synchroniser avec HA. En aperçu, configure
+          // a déjà posé l'apparence forcée (comme l'intensité d'une lumière).
+          if (this._hass && !this._effects.isPreviewing(cfg.id)) {
+            this._effects.applyStates(this._hass.states);
+          }
+          this._applyHighlight();
+          this._requestRender();
+        }
+        return applied;
+      },
+      (id, forced) => {
+        if (forced === null && this._hass) {
+          this._effects.setPreview(id, null);
+          this._effects.applyStates(this._hass.states);
+        } else {
+          this._effects.setPreview(id, forced);
+        }
+        this._requestRender();
+      },
+    );
+
+    this._editPanel.onTestRule = (rule) => this.runRuleNow(rule);
+    this._editPanel.setInitialTab(tab);
+    // Le panneau ancré à droite : la 3D se recentre sur ce qui reste visible.
+    this._editPanel.onDock = (px) => { this._viewShift = -px; this._applyViewShift(); };
+    this._editPanel.onLightHostsChanged = () => this._refreshLightHosts();
+    console.debug('[Houscape] import:', {
+      admin: this._hass?.user?.is_admin, scene: this._getActiveSceneId(), backendDown: this._backendDown,
+    });
+    this._editPanel.onDrawPlan = () => this.openPlanEditor();
+    this._editPanel.getSetupSteps = () => this._setupSteps();
+    if (this._plan) this._editPanel.onAutoPlace = () => this._autoPlace();
+    this._editPanel.onPerfHud = (on) => this._setPerfHud(on);
+    this._editPanel.onPreviewTilt = (id, on) => { this._parts.previewTilt(id, on); this._requestRender(); };
+    if (this._plan) {
+      // L'apparence de la façade : sur le plan, pour tous les étages.
+      this._editPanel.getPlanLook = () => {
+        const p = this._scene?.plan;
+        if (!p) return null;
+        // Un toit réglé avant qu'il ne passe sur le plan compte encore.
+        const old = this._scene?.settings?.rendering;
+        const legacy = !p.roof && old?.roof === 'hip';
+        return {
+          outside: p.outside, facade: p.facade, plinth: p.plinth,
+          roof: legacy ? 'hip' : p.roof,
+          roofColor: legacy ? (old?.roof_color === 'tile' ? undefined : old?.roof_color) : p.roofColor,
+        };
+      };
+      this._editPanel.setPlanLook = (patch) => {
+        const p = this._scene?.plan;
+        if (!p || !this._scene) return;
+        // Une façade choisie ici vaut pour toute la maison : les étages la reprennent.
+        const floors = 'outside' in patch || 'facade' in patch
+          ? p.floors?.map((f) => ({ ...f, doc: { ...f.doc, outside: undefined, facade: undefined } }))
+          : p.floors;
+        // Le toit vit désormais sur le plan : l'ancien réglage de scène ne doit plus le contredire.
+        if ('roof' in patch) {
+          const cur = this._scene.settings ?? {};
+          this._scene = { ...this._scene, settings: { ...cur, rendering: { ...(cur.rendering ?? {}), roof: 'flat' } } };
+        }
+        this.applyPlan({ ...this._scene.plan!, ...patch, ...(floors ? { floors } : {}) });
+        this._schedulePlanSave(400);
+      };
+      this._editPanel.partFloor = (part) => {
+        const k = this._partFloorIndex(part);
+        return k !== null && k !== this._floorIndex() ? this._floors()[k]?.name ?? null : null;
+      };
+      this._editPanel.floors = {
+        list: () => this._floors().map((f) => f.name),
+        active: () => this._floorIndex(),
+        set: (k) => this._setFloor(k),
+      };
+      // La pièce du plan qui porte le nom de la pièce HA (ou d'un de ses alias) donne sa couleur.
+      this._editPanel.roomColor = (areaName) => {
+        const p = this._scene?.plan;
+        if (!p) return null;
+        const reg = cachedRegistry();
+        const area = [...reg.areas.values()].find((x) => x.name === areaName);
+        const names = new Set([areaName, ...(area?.aliases ?? [])].map(normalizeName));
+        for (const v of floorViews(p)) {
+          const r = v.doc.rooms.find((q) => names.has(normalizeName(q.name)));
+          if (r) return r.floor ?? null;
+        }
+        return null;
+      };
+      this._editPanel.anchorFloor = (a) => {
+        if (!this._plan?.floors?.length) return null;
+        const k = this._floorOfY(a.position.y);
+        return k !== this._floorIndex() ? this._floors()[k]?.name ?? null : null;
+      };
+      this._editPanel.showPartFloor = (part) => {
+        const k = this._partFloorIndex(part);
+        if (k !== null) { this._setFloor(k); this._editPanel?.refreshPartsList(); }
+      };
+    }
+    this._editPanel.onCustomize = () => { this._exitEditMode(); this._ui?.openSheet(); };
+    this._editPanel.countDetectedOpenings = () => this._detectedOpenings().length;
+    this._editPanel.onAddDetectedOpenings = () => this._addDetectedOpenings();
+    this._editPanel.countAllDetectedOpenings = () => this._detectedOpenings(true).length;
+    this._editPanel.onReplaceDetectedOpenings = () => this._replaceWithDetected();
+    if (this._canImport()) {
+      this._editPanel.onImportModel = () => pickFiles((files) => this._importModel(files));
+    }
+
+    this._editor.onAnchorCreated = (key, anchor) => {
+      if (anchor.entity.split('.')[0] === 'light') this._editPanel?.openLightModal(key, { isNew: true });
+    };
+
+    this._editor.onChanged = () => {
+      this._requestShadowUpdate();
+      this._syncEditorLightsToScene();
+      this._evaluatePassiveConditions();
+      this._requestRender();
+      if (!this._editPanel?.editorDragging && !this._editPanel?.gizmoDragging) this._editPanel?.updateAnchorList();
+      // Don't schedule auto-save in the middle of a gizmo drag — wait for drag end
+      if (!this._editPanel?.gizmoDragging) this._editPanel?.scheduleAutoSave();
+    };
+    this._editor.onDragStart = (type) => {
+      if (this._editPanel) this._editPanel.gizmoDragging = true;
+      const texts: Record<string, string> = {
+        grab:   t('hintBarGrab'),
+        rotate: t('hintBarRotate'),
+        gizmo:  t('hintBarAxis'),
+      };
+      this._editPanel?.showStatusBar(texts[type] ?? '');
+    };
+    this._editor.onDragEnd = () => {
+      if (this._editPanel) this._editPanel.gizmoDragging = false;
+      this._editPanel?.hideStatusBar();
+      this._editPanel?.updateAnchorList();  // refresh Az/El readout etc.
+      this._editPanel?.scheduleAutoSave();  // save once when drag finishes
+    };
+    this._editor.onSelectionChange = (key) => {
+      // Un appareil choisi dans la liste, à un autre étage : on y va.
+      const a = key ? this._editor?.anchors.get(key) : null;
+      if (a && this._plan?.floors?.length) {
+        const k = this._floorOfY(a.position.y);
+        if (k !== this._floorIndex()) this._setFloor(k);
+      }
+      if (this._plan?.floors?.length) this._editor?.setMarkerFilter((p) => this._floorOfY(p.y) === this._floorIndex());
+      this._editPanel?.updateAnchorList();
+    };
+    // Seuls les repères de l'étage regardé.
+    this._editor.setMarkerFilter(this._plan?.floors?.length ? (p) => this._floorOfY(p.y) === this._floorIndex() : null);
+    this._editor.onToolChange = (_tool) => {
+      // Card placement is triggered from the sidebar, not from a tool button
+    };
+    this._editor.setHass(this._hass);
+    this._editor.activate(editable);
+
+    document.addEventListener('keydown', this._onCardKeyDown);
+
+    this._editPanel.showToolbar();
+    this._requestRender();
+
+    // Sans appareil, la liste vide du panneau explique déjà quoi faire.
+  }
+
+  private _exitEditMode() {
+    queueMicrotask(() => this._updateRoofVisibility());
+    if (this._previewTimer) { clearTimeout(this._previewTimer); this._previewTimer = null; }
+    this._previewingRule = false;
+    this._requestShadowUpdate();
+    this._editMode = false;
+    this._mergeStatic();
+    this._ui?.setHidden(false);
+    this._setFullscreen('edit', false);
+    const welcome = this.overlayContainer?.querySelector<HTMLElement>('#houscape-demo-banner');
+    if (welcome) welcome.style.display = 'flex';
+
+    document.removeEventListener('keydown', this._onCardKeyDown);
+    this._selectedCardId = null;
+    this._cardGrabMode = false;
+    this._cardPlacementMode = false;
+    this._cardPlacementType = null;
+    this._gizmoDragAxis = null;
+    this._cardRenderer?.setSelectedId(null);
+    this._cardRenderer?.setHoveredId(null);
+    this._panelGizmo?.setVisible(false);
+    this._panelGizmo?.setHover(null);
+    if (this.controls) this.controls.enabled = !this._locked;
+
+    // Flush pending auto-save immediately
+    if (this._editPanel?.hasPendingSave) {
+      this._editPanel.cancelPendingSave();
+      this._saveScene();
+    }
+    this._editPanel?.markSaved();
+
+    const editable = new Map<string, EditableAnchor>(this._editor!.anchors as Map<string, EditableAnchor>);
+    this._editor!.deactivate();
+    this._lampAnchorsToPlan(editable);
+
+    this.anchors.forEach((entry) => {
+      if (this.scene) disposeEntryLights(entry, this.scene);
+    });
+
+    this.anchors = buildAnchorsFromEditable(
+      editable, this.scene!, this._effectiveConfig, this._modelSpan, this._modelRoot,
+    );
+    this._applyAttachPositions();
+
+    if (this.controls) this.controls.enabled = !this._locked;
+
+    this._createOverlays();
+    if (this._hass) {
+      syncLights(this.anchors, this._hass, this._config, this._modelSpan);
+      this._lightEmissive.sync(this._modelRoot, this.anchors, this._hass);
+      this._updateOverlayStates();
+    }
+
+    this._editPanel?.hideToolbar();
+    this._editPanel = null;
+    this.overlays.forEach((o) => {
+      o.el.style.display = this._overlaysVisible ? '' : 'none';
+    });
+    this._requestRender();
+  }
+
+  // ── Real-time light sync from editor ──────────────────────────────────
+
+  private _syncEditorLightsToScene() {
+    if (!this._editor || !this.scene) return;
+    const hostSig = (a: Parameters<typeof listLightHosts>[0]) =>
+      JSON.stringify(listLightHosts(a));
+    const styleSig = (a: Parameters<typeof listLightStyles>[0]) =>
+      listLightStyles(a).join(',');
+
+    this._editor.anchors.forEach((ea, key) => {
+      let entry = this.anchors.get(key);
+      if (!entry) {
+        // Ancre créée en édition : fabriquer l'entrée runtime à la volée.
+        if (!this._modelRoot) return;
+        const built = buildAnchorsFromEditable(
+          new Map([[key, ea]]), this.scene!, this._effectiveConfig, this._modelSpan, this._modelRoot,
+        );
+        entry = built.get(key);
+        if (!entry) return;
+        this.anchors.set(key, entry);
+      }
+      // L'ancre d'une lampe posée emmène la lampe avec elle.
+      if (ea.planId?.startsWith('plan_lamp_') && this._modelRoot) {
+        const holder = this._modelRoot.getObjectByName(`plan_item_${ea.planId.slice('plan_lamp_'.length)}`);
+        if (holder?.parent) {
+          const local = holder.parent.worldToLocal(ea.position.clone());
+          holder.position.x = local.x;
+          holder.position.z = local.z;
+          holder.updateMatrixWorld(true);
+        }
+      }
+
+      const newStyles = listLightStyles(ea);
+      const oldStyles = listLightStyles(entry);
+      const newCast = ea.castLight !== false;
+      const oldCast = castLightsOf(entry).length > 0;
+      const hostsChanged = hostSig(ea) !== hostSig(entry);
+      const stylesChanged = styleSig(ea) !== styleSig(entry);
+      const isLight = ea.entity.split('.')[0] === 'light';
+      const hosts = this._modelRoot && hasLightHost(ea)
+        ? resolveLightHosts(this._modelRoot, ea).filter((h) => !hostIsOpeningPiece(h))
+        : [];
+
+      entry.entityId = ea.entity;
+      entry.domain = ea.entity.split('.')[0];
+      entry.label = ea.label;
+      entry.hidden = ea.hidden;
+      entry.lightIntensity = ea.lightIntensity;
+      entry.castLight = ea.castLight;
+      entry.lightMesh = ea.lightMesh;
+      entry.lightMeshIndex = ea.lightMeshIndex;
+      entry.lightTriangle = ea.lightTriangle;
+      entry.lightMeshes = ea.lightMeshes?.map((h) => ({ ...h }));
+      entry.emissiveLevel = ea.emissiveLevel;
+      entry.linkEmissiveBrightness = ea.linkEmissiveBrightness;
+      entry.attachLightToObject = ea.attachLightToObject;
+      entry.lightColor = ea.lightColor;
+      entry.lightColorTemp = ea.lightColorTemp;
+      entry.visibleIf = ea.visibleIf;
+      entry.lightStyle = ea.lightStyle;
+      entry.lightStyles = ea.lightStyles ? [...ea.lightStyles] : undefined;
+
+      const needRebuild = isLight && (
+        stylesChanged
+        || newCast !== oldCast
+        || (hasMeshStyle(ea) && hostsChanged)
+        || (oldStyles.includes('mesh') && hostsChanged)
+      );
+
+      const poseNonMesh = (pos: THREE.Vector3) => {
+        for (const light of castLightsOf(entry!)) {
+          if (light instanceof THREE.RectAreaLight) continue;
+          light.position.copy(pos);
+        }
+        for (const target of castLightTargetsOf(entry!)) {
+          target.position.copy(lightTargetPos(pos, ea.lightDirection));
+          target.updateMatrixWorld();
+        }
+      };
+
+      if (needRebuild) {
+        entry.castLight = ea.castLight;
+        rebuildAnchorLight(
+          entry, this.scene!, this._effectiveConfig, newStyles, ea.lightDirection, this._modelSpan, hosts,
+        );
+        for (const light of castLightsOf(entry)) {
+          light.intensity = entry.targetIntensity;
+          light.color.copy(entry.targetColor);
+          light.visible = entry.targetIntensity > 0.01;
+        }
+        // La lampe reconstruite reprend sa place dans le budget de lumières.
+        this._applyFloorLights();
+        if (ea.attachLightToObject && hosts.length) {
+          const center = lightHostsCenter(hosts);
+          entry.worldPos.copy(center);
+          poseNonMesh(center);
+          if (ea.position.distanceToSquared(center) > 1e-8) {
+            this._editor!.moveAnchorTo(key, center);
+          }
+        }
+      } else if (hasMeshStyle(ea) && hosts.length) {
+        syncMeshLightPoses(entry, hosts);
+        if (ea.attachLightToObject) {
+          const center = lightHostsCenter(hosts);
+          entry.worldPos.copy(center);
+          poseNonMesh(center);
+          if (ea.position.distanceToSquared(center) > 1e-8) {
+            this._editor!.moveAnchorTo(key, center);
+          }
+        } else {
+          entry.worldPos.copy(ea.position);
+          poseNonMesh(entry.worldPos);
+        }
+      } else if (
+        ea.attachLightToObject
+        && hosts.length
+        && isLight
+      ) {
+        const center = lightHostsCenter(hosts);
+        if (ea.position.distanceToSquared(center) > 1e-8) {
+          this._editor!.moveAnchorTo(key, center);
+        }
+        entry.worldPos.copy(center);
+        poseNonMesh(center);
+      } else {
+        entry.worldPos.copy(ea.position);
+        poseNonMesh(entry.worldPos);
+      }
+
+      if (!needRebuild) {
+        if (hasDirectionalStyle(ea)) {
+          const newDir = ea.lightDirection;
+          const oldDir = entry.lightDirection;
+          const dirChanged = !newDir !== !oldDir ||
+            (newDir && oldDir && (newDir[0] !== oldDir[0] || newDir[1] !== oldDir[1] || newDir[2] !== oldDir[2]));
+          if (dirChanged) {
+            for (const target of castLightTargetsOf(entry)) {
+              target.position.copy(lightTargetPos(entry.worldPos, ea.lightDirection));
+              target.updateMatrixWorld();
+            }
+            entry.lightDirection = ea.lightDirection;
+          }
+        } else {
+          entry.lightDirection = ea.lightDirection;
+        }
+      }
+    });
+
+    // Retirer les ancres runtime absentes de l'éditeur.
+    for (const key of [...this.anchors.keys()]) {
+      if (!this._editor.anchors.has(key)) {
+        const entry = this.anchors.get(key)!;
+        if (this.scene) disposeEntryLights(entry, this.scene);
+        this.anchors.delete(key);
+      }
+    }
+
+    if (this._hass) {
+      syncLights(this.anchors, this._hass, this._effectiveConfig, this._modelSpan);
+      this._lightEmissive.sync(this._modelRoot, this.anchors, this._hass);
+    }
+  }
+
+  /** Remarque les hôtes émissifs et refusionne le batch (hors édition). */
+  private _refreshLightHosts() {
+    if (!this._modelRoot) return;
+    this._batch?.unmerge();
+    this._lightEmissive.markHosts(this._modelRoot, this.anchors.values());
+    this._mergeStatic();
+    if (this._hass) this._lightEmissive.sync(this._modelRoot, this.anchors, this._hass);
+    this._requestRender();
+  }
+
+  // ── Panel keyboard handler ─────────────────────────────────────────────
+
+  private _onCardKeyDown = (e: KeyboardEvent) => {
+    if (!this._editMode) return;
+    let el: Element | null = document.activeElement;
+    while (el?.shadowRoot) el = el.shadowRoot.activeElement;
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(el?.tagName ?? '')) return;
+
+    // Escape cancels placement mode
+    if (e.key === 'Escape' && this._cardPlacementMode) {
+      this._cardPlacementMode = false;
+      this._cardPlacementType = null;
+      this._editPanel?.hideStatusBar();
+      if (this.canvas) this.canvas.style.cursor = '';
+      this._editPanel?.updateAnchorList();
+      e.preventDefault();
+      return;
+    }
+
+    if (!this._selectedCardId) return;
+
+    if ((e.key === 'g' || e.key === 'G') && !this._cardGrabMode) {
+      const card = this._cardRenderer?.getCard(this._selectedCardId);
+      if (!card) return;
+      this._editPanel?.pushCardSnapshot();
+      this._cardGrabMode = true;
+      this._cardGrabOrigin = [...card.position] as [number, number, number];
+      if (this.camera) {
+        const camFwd = new THREE.Vector3();
+        this.camera.getWorldDirection(camFwd);
+        camFwd.negate();
+        this._cardGrabPlane.setFromNormalAndCoplanarPoint(camFwd, new THREE.Vector3(...card.position));
+      } else {
+        this._cardGrabPlane.setFromNormalAndCoplanarPoint(new THREE.Vector3(0, 0, 1), new THREE.Vector3(...card.position));
+      }
+      this._editPanel?.showStatusBar(t('hintBarMoveCard'));
+      e.preventDefault();
+    }
+    if (this._cardGrabMode) {
+      if (e.key === 'Enter') { this._confirmCardGrab(); e.preventDefault(); }
+      if (e.key === 'Escape') { this._cancelCardGrab(); e.preventDefault(); }
+    }
+    if ((e.key === 'Delete' || e.key === 'x' || e.key === 'X') && !this._cardGrabMode) {
+      this._deleteSelectedCard();
+      e.preventDefault();
+    }
+  };
+
+  private _confirmCardGrab() {
+    if (!this._cardGrabMode || !this._selectedCardId) return;
+    this._cardGrabMode = false;
+    this._cardGrabOrigin = null;
+    if (this.controls) this.controls.enabled = !this._locked;
+    this._editPanel?.hideStatusBar();
+
+    const mesh = this._cardRenderer?.getMeshes().find((m) => m.userData.cardId === this._selectedCardId);
+    if (!mesh) return;
+    const newPos: [number, number, number] = [
+      +mesh.position.x.toFixed(4),
+      +mesh.position.y.toFixed(4),
+      +mesh.position.z.toFixed(4),
+    ];
+    this._panelGizmo?.setPosition(mesh.position);
+    this._panelGizmo?.setVisible(true);
+
+    const cards = (this._scene?.cards ?? []).map((c) =>
+      c.id === this._selectedCardId ? { ...c, position: newPos } : c,
+    );
+    this._saveCardsDirect(cards);
+  }
+
+  private _cancelCardGrab() {
+    if (!this._cardGrabMode || !this._selectedCardId || !this._cardGrabOrigin) return;
+    this._cardGrabMode = false;
+    const origPos = new THREE.Vector3(...this._cardGrabOrigin);
+    this._cardRenderer?.previewPosition(this._selectedCardId, origPos);
+    this._cardGrabOrigin = null;
+    if (this.controls) this.controls.enabled = !this._locked;
+    this._editPanel?.hideStatusBar();
+    this._panelGizmo?.setPosition(origPos);
+    this._panelGizmo?.setVisible(true);
+  }
+
+  private _deleteSelectedCard() {
+    if (!this._selectedCardId) return;
+    const cards = (this._scene?.cards ?? []).filter((c) => c.id !== this._selectedCardId);
+    this._selectedCardId = null;
+    this._cardRenderer?.setSelectedId(null);
+    this._panelGizmo?.setVisible(false);
+    this._editPanel?.updateAnchorList();
+    this._saveCardsDirect(cards);
+  }
+
+  /** Activate placement mode: next scene click places a card of the given type. */
+  startCardPlacement(type: SceneCardType) {
+    this._cardPlacementMode = true;
+    this._cardPlacementType = type;
+    this._editPanel?.showStatusBar(t('hintBarPlaceCard'));
+    if (this.canvas) this.canvas.style.cursor = 'crosshair';
+  }
+
+  private _startCardPlacement(type: SceneCardType) {
+    this.startCardPlacement(type);
+  }
+
+  private async _placeNewCard(type: SceneCardType, position: [number, number, number]) {
+    const defaults: Partial<SceneCard> = type === 'entity' ? { entity_id: '' } : {};
+    const newCard = {
+      id: `card_${Date.now()}`,
+      type,
+      name: type === 'room' ? t('cardTypeRoom') : type === 'entity' ? t('cardTypeEntity') : t('cardTypeInfo'),
+      position,
+      visible: true,
+      size: 'medium' as const,
+      ...defaults,
+    } as SceneCard;
+
+    const cards = [...(this._scene?.cards ?? []), newCard];
+    this._cardPlacementMode = false;
+    this._cardPlacementType = null;
+    this._editPanel?.hideStatusBar();
+    if (this.canvas) this.canvas.style.cursor = '';
+
+    this._editPanel?.pushCardSnapshot();
+    await this._saveCardsDirect(cards);
+
+    this._selectedCardId = newCard.id;
+    this._cardRenderer?.setSelectedId(newCard.id);
+    const cardPos = new THREE.Vector3(...position);
+    this._panelGizmo?.setPosition(cardPos);
+    this._panelGizmo?.setVisible(true);
+    if (this.camera) this._panelGizmo?.updateScale(this.camera);
+    this._editPanel?.updateAnchorList();
+  }
+
+  /** Save cards to backend and update local scene. */
+  private async _saveCardsDirect(cards: SceneCard[]) {
+    const sceneId = this._getActiveSceneId();
+    const hass = this._hass;
+    const current = this._scene;
+    if (!sceneId || !hass) {
+      if (current) this._scene = { ...current, cards };
+      this._cardRenderer?.syncCards(cards, this._hass);
+      this._editPanel?.updateAnchorList();
+      return;
+    }
+    try {
+      const base = current ?? {
+        version: 1, scene_id: sceneId,
+        model_url: this._config?.model_url ?? '',
+        anchors: [], camera_views: [], cards: [], rules: [], parts: [], effects: [],
+      };
+      const updated = { ...base, cards };
+      await saveScene(hass, sceneId, updated);
+      this._scene = updated;
+    } catch (err) {
+      console.error('[Houscape] Card save failed:', err);
+    }
+    this._cardRenderer?.syncCards(cards, this._hass);
+    this._editPanel?.updateAnchorList();
+  }
+
+  private async _saveRulesDirect(rules: HouscapeRule[]) {
+    const sceneId = this._getActiveSceneId();
+    const hass = this._hass;
+    const current = this._scene;
+    if (!sceneId || !hass) {
+      if (current) this._scene = { ...current, rules };
+      return;
+    }
+    try {
+      const base = current ?? {
+        version: 1, scene_id: sceneId,
+        model_url: this._config?.model_url ?? '',
+        anchors: [], camera_views: [], cards: [], rules: [], parts: [], effects: [],
+      };
+      const updated = { ...base, rules };
+      await saveScene(hass, sceneId, updated);
+      this._scene = updated;
+    } catch (err) {
+      console.error('[Houscape] Rules save failed:', err);
+    }
+  }
+
+  /**
+   * Enregistre les ouvrants et remonte le modèle en conséquence.
+   *
+   * Détacher une pièce retire ses triangles de la maille : on ne peut pas
+   * appliquer un changement par-dessus l'état courant, il faut repartir du
+   * modèle d'origine. D'où le rechargement, qui reste local (le fichier est
+   * dans le cache du navigateur).
+   */
+  private async _savePartsDirect(parts: import('./types').HouscapePart[]) {
+    const sceneId = this._getActiveSceneId();
+    const hass = this._hass;
+    const current = this._scene;
+    const before = current?.parts ?? [];
+    const base = current ?? {
+      version: 1, scene_id: sceneId ?? '',
+      model_url: this._config?.model_url ?? '',
+      anchors: [], camera_views: [], cards: [], rules: [], parts: [], effects: [],
+    };
+    const updated = { ...base, parts };
+    this._scene = updated;
+
+    if (sceneId && hass) {
+      try {
+        await saveScene(hass, sceneId, updated);
+      } catch (err) {
+        console.error('[Houscape] Parts save failed:', err);
+      }
+    }
+    // Un ajout ou une suppression change la géométrie détachée : il faut
+    // repartir du modèle d'origine. Un simple réglage passe par `configure`
+    // et n'arrive jamais ici.
+    const ids = new Set(parts.map((p) => p.id));
+    const known = new Set(before.map((p) => p.id));
+    // Un changement de cible est d'ordinaire déjà monté par `configure` ; il
+    // ne faut recharger que s'il n'a pas pu l'être.
+    const prev = new Map(before.map((p) => [p.id, partTargetKey(p)]));
+    const unmounted = parts.some((p) => prev.get(p.id) !== partTargetKey(p) && !this._parts.hasTarget(p));
+    const structural = ids.size !== known.size || [...ids].some((id) => !known.has(id)) || unmounted;
+    if (structural) this.refreshParts();
+  }
+
+  /** Enregistre les effets et remonte ceux dont la cible a changé. */
+  private async _saveEffectsDirect(effects: import('./types').HouscapeEffect[]) {
+    const sceneId = this._getActiveSceneId();
+    const hass = this._hass;
+    const current = this._scene;
+    const before = current?.effects ?? [];
+    const base = current ?? {
+      version: 1, scene_id: sceneId ?? '',
+      model_url: this._config?.model_url ?? '',
+      anchors: [], camera_views: [], cards: [], rules: [], parts: [], effects: [],
+    };
+    const updated = { ...base, effects };
+    this._scene = updated;
+
+    if (sceneId && hass) {
+      try {
+        await saveScene(hass, sceneId, updated);
+      } catch (err) {
+        console.error('[Houscape] Effects save failed:', err);
+      }
+    }
+    const ids = new Set(effects.map((e) => e.id));
+    const known = new Set(before.map((e) => e.id));
+    for (const id of known) {
+      if (!ids.has(id)) this._effects.remove(id);
+    }
+    const prev = new Map(before.map((e) => [e.id, effectTargetKey(e)]));
+    const unmounted = effects.some(
+      (e) => prev.get(e.id) !== effectTargetKey(e) && !this._effects.hasTarget(e),
+    );
+    const structural = ids.size !== known.size || [...ids].some((id) => !known.has(id)) || unmounted;
+    if (structural) this._rebuildEffects();
+  }
+
+  /**
+   * Surligne ce que l'éditeur désigne, d'après la dernière demande.
+   *
+   * Une cible se cherche d'abord parmi les ouvrants montés — une pièce
+   * détachée n'est plus dans sa maille —, puis parmi les nœuds, puis comme
+   * pièce d'une maille.
+   */
+  private _applyHighlight() {
+    this._highlight.clear();
+    const root = this._modelRoot;
+    if (root) {
+      for (const slot of ['hover', 'selected'] as const satisfies readonly HighlightSlot[]) {
+        const target = this._highlightReq[slot];
+        const list = !target ? [] : Array.isArray(target) ? target : [target];
+        const srcs = list
+          .map((t) => this._resolveHighlight(root, t))
+          .filter((s): s is HighlightSource => !!s);
+        if (srcs.length) this._highlight.show(slot, srcs);
+      }
+      const sel = this._highlightReq.selected;
+      const primary = Array.isArray(sel) ? sel[0] : sel;
+      const followers = primary?.followers ?? [];
+      if (followers.length) {
+        const order = nodeOrder(root);
+        const srcs = followers.map((r) => order[r]).filter((o): o is THREE.Object3D => !!o).map((object) => ({ object }));
+        this._highlight.show('follower', srcs);
+      }
+    }
+    this._requestRender();
+  }
+
+  private _resolveHighlight(
+    root: THREE.Object3D,
+    t: import('./card/edit-panel').PartHighlightTarget,
+  ): HighlightSource | null {
+    if (t.part) {
+      const obj = this._parts.objectOf(t.part);
+      if (obj) return { object: obj };
+      // Effet multi-cibles : la première suffit ici ; les autres passent par
+      // `followers` (même emplacement de surlignage que les suiveurs).
+      const effectObjs = this._effects.objectsOf(t.part);
+      if (effectObjs[0]) return { object: effectObjs[0] };
+    }
+    if (t.node !== undefined) {
+      const obj = nodeOrder(root)[t.node];
+      if (obj) return { object: obj };
+    }
+    if (t.mesh !== undefined && t.triangle !== undefined) {
+      const mesh = meshOrder(root)[t.mesh];
+      if (!mesh) return null;
+      const index = partIndexOf(mesh);
+      const id = index.ofTriangle[t.triangle];
+      if (id === undefined || id < 0) return null;
+      return { mesh, tris: index.parts[id].tris };
+    }
+    return null;
+  }
+
+  /**
+   * Attend le prochain clic sur le modèle et renvoie la pièce touchée.
+   *
+   * Le clic reste l'entrée : sur 2 600 composantes, désigner du doigt est la
+   * seule interaction praticable. L'arborescence du formulaire permet ensuite
+   * d'élargir la sélection à l'objet ou au groupe qui contient la pièce.
+   */
+  private _startPartPicking(
+    onPicked: (hit: import('./card/edit-panel').PickedPart) => void,
+    mode: 'part' | 'lightHost' = 'part',
+  ) {
+    this._partPickHandler = onPicked;
+    this._partPickMode = mode;
+    if (this.canvas) this.canvas.style.cursor = 'crosshair';
+  }
+
+  /** La pièce sous un point de l'écran, comme un clic la prendrait. */
+  private _pieceAt(ndc: THREE.Vector2): { hit: THREE.Intersection; source: HighlightSource; key: string } | null {
+    if (!this.camera || !this._modelRoot) return null;
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(ndc, this.camera);
+    const hit = ray.intersectObject(this._modelRoot, true).find((h) => h.faceIndex !== undefined && (h.object as THREE.Mesh).isMesh);
+    if (!hit) return null;
+    const mesh = hit.object as THREE.Mesh;
+    // Une pièce déjà détachée (un ouvrant monté) s'éclaire en entier.
+    if (mesh.userData.houscapePartId) return { hit, source: { object: mesh }, key: mesh.uuid };
+    const index = partIndexOf(mesh);
+    const id = index.ofTriangle[hit.faceIndex!];
+    const part = id >= 0 ? index.parts[id] : null;
+    if (!part) return null;
+    return { hit, source: { mesh, tris: part.tris }, key: `${mesh.uuid}:${id}` };
+  }
+
+  private _pickHoverNdc: THREE.Vector2 | null = null;
+  private _pickHoverQueued = false;
+  private _pickHoverKey = '';
+
+  /** Au plus une recherche par image : un survol rapide ne lance pas un rayon par événement. */
+  private _queuePickHover(ndc: THREE.Vector2) {
+    this._pickHoverNdc = ndc;
+    if (this._pickHoverQueued) return;
+    this._pickHoverQueued = true;
+    requestAnimationFrame(() => {
+      this._pickHoverQueued = false;
+      if (!this._partPickHandler || !this._pickHoverNdc) return;
+      const found = this._pieceAt(this._pickHoverNdc);
+      const key = found?.key ?? '';
+      if (key === this._pickHoverKey) return;
+      this._pickHoverKey = key;
+      if (found) this._highlight.show('hover', [found.source]);
+      else this._highlight.clear('hover');
+      this._requestRender();
+    });
+  }
+
+  /** Fin du survol : l'éditeur retrouve ses propres surlignages. */
+  private _endPickHover() {
+    this._pickHoverKey = '';
+    this._pickHoverNdc = null;
+    this._applyHighlight();
+  }
+
+  /** Surligne l'objet sous le curseur pendant un pick (ouvrant ou hôte lumière). */
+  private _handlePartPickHover(ndc: THREE.Vector2) {
+    if (!this.camera || !this._modelRoot) return;
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(ndc, this.camera);
+    const hits = ray.intersectObject(this._modelRoot, true);
+    const hit = hits.find((h) => {
+      const m = h.object as THREE.Mesh;
+      return h.faceIndex !== undefined && m.isMesh && !m.userData.houscapeHelper && !m.userData.houscapeBatch;
+    });
+    let hover: import('./card/edit-panel').PartHighlightTarget | null = null;
+    if (hit) {
+      const mesh = hit.object as THREE.Mesh;
+      if (this._partPickMode === 'lightHost') {
+        // Hôte lumière : toute la maille (l'émisivité s'applique au mesh).
+        const r = rankOf(mesh);
+        if (r !== undefined) hover = { node: r };
+      } else {
+        const ownerId = mesh.userData.houscapePartId as string | undefined;
+        if (ownerId) hover = { part: ownerId };
+        else {
+          const mi = meshOrder(this._modelRoot).indexOf(mesh);
+          const tri = hit.faceIndex;
+          if (mi >= 0 && tri != null) {
+            hover = { mesh: mi, triangle: tri };
+          }
+        }
+      }
+    }
+    const prev = this._highlightReq.hover;
+    if (JSON.stringify(prev) === JSON.stringify(hover)) return;
+    this._highlightReq = { ...this._highlightReq, hover };
+    this._applyHighlight();
+  }
+
+  private _clearPartPickHover() {
+    if (!this._highlightReq.hover) return;
+    this._highlightReq = { ...this._highlightReq, hover: null };
+    this._applyHighlight();
+  }
+
+  private _handlePartPick(
+    ndc: THREE.Vector2,
+    ev?: { ctrlKey?: boolean; metaKey?: boolean },
+  ): boolean {
+    const cb = this._partPickHandler;
+    if (!cb || !this.camera || !this._modelRoot) return false;
+
+    const found = this._pieceAt(ndc);
+    if (!found) return false;
+    const hit = found.hit;
+
+    const pickMode = this._partPickMode;
+    const toggle = !!(ev?.ctrlKey || ev?.metaKey);
+    // Ctrl sur hôte lumière : bascule et reste en mode pick pour enchaîner.
+    const stay = pickMode === 'lightHost' && toggle;
+    if (!stay) {
+      this._partPickHandler = null;
+      if (this.canvas) this.canvas.style.cursor = '';
+      this._partPickMode = 'part';
+      this._clearPartPickHover();
+      this._endPickHover();
+    }
+
+    const mesh = hit.object as THREE.Mesh;
+    // Le modèle peut être en mètres comme en centimètres : on cale l'échelle
+    // sur une hauteur d'étage plausible pour que les cotes affichées parlent.
+    const span = this._modelSpan;
+    const unitToCm = span > 50 ? 1 : 100;
+
+    // Pièce déjà détachée : elle n'est plus dans sa maille, et son propre
+    // triangle ne dit rien du modèle. On rend l'ouvrant qui la porte.
+    // En mode hôte lumière, on garde la maille touchée (pas l'ouvrant).
+    const ownerId = mesh.userData.houscapePartId as string | undefined;
+    const owner = pickMode === 'part' && ownerId
+      ? this._scene?.parts?.find((p) => p.id === ownerId)
+      : undefined;
+    if (owner) {
+      mesh.geometry.computeBoundingBox();
+      const box = mesh.geometry.boundingBox!;
+      const frame = partFrame(box);
+      cb({
+        mesh: owner.mesh,
+        meshIndex: owner.meshIndex ?? -1,
+        triangle: owner.triangle,
+        size: [frame.size[frame.up] * unitToCm, frame.size[frame.wide] * unitToCm, frame.size[frame.thin] * unitToCm],
+        guess: guessPart(box, unitToCm),
+        triangles: (mesh.geometry.getAttribute('position').count / 3) | 0,
+        partId: owner.id,
+        toggle,
+      });
+      return true;
+    }
+    const index = partIndexOf(mesh);
+    const partId = index.ofTriangle[hit.faceIndex!];
+    const part = partId >= 0 ? index.parts[partId] : null;
+    if (!part) return false;
+
+    const frame = partFrame(part.box);
+    cb({
+      mesh: mesh.name,
+      meshIndex: meshOrder(this._modelRoot).indexOf(mesh),
+      triangle: hit.faceIndex!,
+      // Hauteur, largeur, épaisseur — dans cet ordre, quelle que soit
+      // l'orientation du modèle.
+      size: [
+        frame.size[frame.up] * unitToCm,
+        frame.size[frame.wide] * unitToCm,
+        frame.size[frame.thin] * unitToCm,
+      ],
+      guess: guessPart(part.box, unitToCm),
+      triangles: part.tris.length,
+      // Un objet posé par des animations n'est pas détaché : c'est son
+      // ouvrant qui le réclame.
+      partId: this._parts.animatedOwnerOf(mesh) ?? undefined,
+      toggle,
+    });
+    return true;
+  }
+
+  // ── Card fly-to ────────────────────────────────────────────────────────────
+
+  private _enterCardFocus(cardId: string) {
+    if (!this.camera || !this.controls) return;
+    const card = this._cardRenderer?.getCard(cardId);
+    if (!card) return;
+
+    this._preFocusPos = this.camera.position.clone();
+    this._preFocusTarget = this.controls.target.clone();
+    this._cardFocusId = cardId;
+
+    const cardPos = new THREE.Vector3(...card.position);
+    const dir = cardPos.clone().sub(this.camera.position).normalize();
+    const newCamPos = cardPos.clone().sub(dir.multiplyScalar(1.2));
+    this._camAnimTo = { pos: newCamPos, target: cardPos };
+  }
+
+  private _exitCardFocus() {
+    if (!this._preFocusPos || !this._preFocusTarget) return;
+    this._camAnimTo = { pos: this._preFocusPos.clone(), target: this._preFocusTarget.clone() };
+    this._cardFocusId = null;
+    this._preFocusPos = null;
+    this._preFocusTarget = null;
+  }
+
+  /** Scroll horizontal par glisser-souris (le overflow natif ne le fait pas). */
+  private _enableHudViewsDragScroll(el: HTMLElement) {
+    let dragging = false;
+    let moved = false;
+    let captured = false;
+    let startX = 0;
+    let startScroll = 0;
+    const DRAG_THRESHOLD = 5;
+
+    el.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.stopPropagation();
+      dragging = true;
+      moved = false;
+      captured = false;
+      startX = e.clientX;
+      startScroll = el.scrollLeft;
+    });
+
+    el.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      e.stopPropagation();
+      const dx = e.clientX - startX;
+      if (!moved && Math.abs(dx) >= DRAG_THRESHOLD) {
+        moved = true;
+        el.style.cursor = 'grabbing';
+        try {
+          el.setPointerCapture(e.pointerId);
+          captured = true;
+        } catch { /* ignore */ }
+      }
+      if (moved) el.scrollLeft = startScroll - dx;
+    });
+
+    const endDrag = (e: PointerEvent) => {
+      if (!dragging) return;
+      dragging = false;
+      el.style.cursor = 'grab';
+      if (captured) {
+        try { el.releasePointerCapture(e.pointerId); } catch { /* déjà libéré */ }
+        captured = false;
+      }
+    };
+    el.addEventListener('pointerup', endDrag);
+    el.addEventListener('pointercancel', endDrag);
+
+    // Après un drag, ne pas déclencher le fly-to du chip sous le pointeur
+    el.addEventListener('click', (e) => {
+      if (!moved) return;
+      e.stopPropagation();
+      e.preventDefault();
+      moved = false;
+    }, true);
+
+    el.addEventListener('wheel', (e) => {
+      e.stopPropagation();
+      // Molette verticale → scroll horizontal de la barre
+      if (Math.abs(e.deltaY) >= Math.abs(e.deltaX) && e.deltaY !== 0) {
+        el.scrollLeft += e.deltaY;
+        e.preventDefault();
+      }
+    }, { passive: false });
+
+    el.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
+  }
+
+  // ── Rebuild normal HUD (called by EditPanel.hideToolbar) ───────────────
+
+  private _rebuildNormalHUD() {
+    if (!this._hudRight) return;
+    // Restore hud position to bottom-right corner
+    if (this._hud) {
+      this._hud.style.left = 'auto';
+      this._hud.style.right = '12px';
+      this._hud.style.transform = 'none';
+      this._hud.style.alignItems = 'flex-end';
+    }
+    // Remove bar glassmorphism (invisible in normal mode)
+    if (this._hudBar) {
+      this._hudBar.style.background = 'none';
+      this._hudBar.style.backdropFilter = 'none';
+      this._hudBar.style.setProperty('-webkit-backdrop-filter', 'none');
+      this._hudBar.style.border = 'none';
+    }
+    // Restore sep to hidden
+    if (this._hudSep) {
+      this._hudSep.innerHTML = '';
+      this._hudSep.style.cssText = 'width:1px;height:18px;background:rgba(255,255,255,0.15);margin:0 4px;flex-shrink:0;display:none;';
+    }
+    // Restore hudLeft
+    if (this._hudLeft) {
+      this._hudLeft.innerHTML = '';
+      this._hudLeft.style.display = 'flex';
+    }
+    this._hudRight.innerHTML = '';
+    if (this._hud) this._hud.style.display = 'none';
+    // L'ancienne barre reçoit encore les vues (le gestionnaire y écrit) : les
+    // modules affichent les leurs.
+    this._viewMgr?.buildHUDBar();
+    if (this._hudViews) { this._hudViews.innerHTML = ''; this._hudViews.style.display = 'none'; }
+    this._ui?.refreshViews();
+    this._ui?.refreshDock();
+  }
+
+  // ── Three.js init ─────────────────────────────────────────────────────
+
+  /**
+   * Hauteur de la carte pour une largeur donnée.
+   *
+   * `fill` se mesure depuis le haut de la carte jusqu'au bas de la fenêtre :
+   * l'en-tête de Home Assistant et tout ce qui précède la carte sont déduits,
+   * sans avoir à connaître leur taille. Un plancher évite une carte écrasée
+   * quand elle est placée tout en bas d'une longue page.
+   */
+  private _cardHeight(container: HTMLElement, w: number): number {
+    if (this._fullscreenHost) return window.innerHeight;
+    const h = this._config?.height;
+    if (h === 'fill') {
+      const top = container.getBoundingClientRect().top;
+      return Math.max(240, Math.round(window.innerHeight - Math.max(0, top)));
+    }
+    return typeof h === 'number' && h > 0 ? h : Math.round(w * 0.75);
+  }
+
+  private _initThree(container: HTMLElement) {
+    const w = container.offsetWidth || 400;
+    const h = this._cardHeight(container, w);
+    container.style.height = `${h}px`;
+
+    const rl = this._config?.rendering ?? {};
+    const useSky = rl.sky !== false && rl.transparent_background !== true;
+    const bgHex = rl.background_color ? parseInt(rl.background_color.replace('#', ''), 16) : 0x0d1117;
+
+    this.scene = new THREE.Scene();
+    this.scene.background = useSky ? null : (rl.transparent_background ? null : new THREE.Color(bgHex));
+    this.scene.fog = rl.transparent_background ? null : new THREE.FogExp2(0x9fc8e8, rl.fog_density ?? 0.018);
+
+    this.camera = new THREE.PerspectiveCamera(45, w / h, 0.01, 2000);
+
+    this._cardRenderer = new SceneCardRenderer(
+      this.scene,
+      this.camera,
+      () => this._requestRender(),
+    );
+    this._panelGizmo = new PanelGizmo(this.scene);
+    this.camera.position.set(0, 5, 12);
+    const shadows = rl.shadows !== false;
+
+    const transparentBg = rl.transparent_background === true;
+    // Profil qualité : antialias est figé à la création du contexte WebGL, donc
+    // c'est le seul réglage qui exige un rechargement de la page pour changer.
+    const q = qualityFromConfig(this._effectiveConfig);
+    this._quality = q;
+    this._lastQualityKey = qualityKey(this._effectiveConfig);
+    // Always alpha:true so transparent_background can be toggled live
+    this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas!, antialias: q.antialias, alpha: true });
+    // Requis pour RectAreaLight (style mesh).
+    ensureRectAreaLightLib();
+    this.renderer.setSize(w, h, false);
+    this.renderer.setPixelRatio(Math.min(devicePixelRatio, q.maxPixelRatio));
+    this.renderer.shadowMap.enabled = shadows;
+    this.renderer.shadowMap.type = q.shadowFilter;
+    // Les ombres ne dépendent pas de la caméra : on ne les recalcule que
+    // lorsqu'une lumière, le soleil ou la géométrie change.
+    this.renderer.shadowMap.autoUpdate = false;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    // Les trémies d'escalier percent les sols par des plans de coupe propres à leurs matériaux.
+    this.renderer.localClippingEnabled = true;
+    this.renderer.toneMappingExposure = rl.exposure ?? 1.4;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    if (transparentBg) this.renderer.setClearColor(0x000000, 0);
+
+    this.controls = new OrbitControls(this.camera, this.canvas!);
+    this.controls.enableDamping = true;
+    this.controls.dampingFactor = 0.08;
+
+    const orb = this._config?.orbit ?? {};
+    // Bornes provisoires : le modèle n'est pas encore chargé, donc son échelle
+    // est inconnue. `_fitOrbitLimits()` les recalcule dès qu'elle l'est.
+    this.controls.minDistance = orb.min_distance ?? 1;
+    this.controls.maxDistance = orb.max_distance ?? 100;
+    this.controls.maxPolarAngle =
+      orb.max_polar_angle !== undefined
+        ? (orb.max_polar_angle * Math.PI) / 180
+        : Math.PI * 0.48;
+
+    this.controls.addEventListener('change', () => this._requestRender());
+    // Toucher la caméra (doigt, souris, molette, clavier) prend la main : un
+    // vol en cours vers une vue s'arrête là où il en est.
+    this.controls.addEventListener('start', () => {
+      this._camAnimTo = null;
+    });
+    this.controls.addEventListener('end', () => this._saveView());
+    // Orbit manuel : la puce active ne doit plus prétendre être la vue courante
+    this.controls.addEventListener('start', () => {
+      if (!this._camAnimTo) this._viewMgr?.clearActiveView();
+    });
+
+    // Hemisphere — warm sky, dark ground so entity point lights stand out
+    this._hemiLight = new THREE.HemisphereLight(0xfff4e0, 0x1a1a2e, rl.ambient_intensity ?? 0.7);
+    this.scene.add(this._hemiLight);
+
+    // Sun directional — soft shadows
+    this._sunLight = new THREE.DirectionalLight(0xfff4c2, rl.sun_intensity ?? 0.8);
+    this._sunLight.position.set(5, 10, 5);
+    this._sunLight.castShadow = shadows;
+    this._sunLight.shadow.mapSize.set(q.sunShadowMap, q.sunShadowMap);
+    this._sunLight.shadow.camera.near = 0.1;
+    this._sunLight.shadow.camera.far = 60;
+    this._sunLight.shadow.camera.left = -15;
+    this._sunLight.shadow.camera.right = 15;
+    this._sunLight.shadow.camera.top = 15;
+    this._sunLight.shadow.camera.bottom = -15;
+    this._sunLight.shadow.bias = -0.0005;
+    this._sunLight.shadow.normalBias = 0.05;
+    this.scene.add(this._sunLight);
+
+    // Procedural sky — visible through windows, updated by sun_entity or default midday
+    if (useSky) {
+      this._sky = new Sky();
+      this._sky.scale.setScalar(1500);
+      this.scene.add(this._sky);
+      const su = this._sky.material.uniforms;
+      su['turbidity'].value = 4;
+      su['rayleigh'].value = 1.2;
+      su['mieCoefficient'].value = 0.005;
+      su['mieDirectionalG'].value = 0.85;
+    }
+
+    // Instantiate EnvironmentController
+    this._env = new EnvironmentController(
+      this.scene,
+      this._hemiLight,
+      this._sunLight,
+      this._sky,
+      () => this._modelBox,
+      () => this._effectiveConfig,
+      () => this._requestRender(),
+    );
+
+    this._env.onSunMoved = () => { this._requestShadowUpdate(); this._updateWindowGlow(); };
+
+    // Set initial sky position
+    if (useSky) {
+      this._env.setSkyPos(rl.sky_elevation ?? 60, 180);
+    }
+
+    this._setupVisibility(container);
+
+    this._lastTime = performance.now();
+    this._loop();
+  }
+
+  // ── Render loop ───────────────────────────────────────────────────────
+
+  private _loop = () => {
+    this.rafId = requestAnimationFrame(this._loop);
+
+    // Carte masquée (autre onglet HA, écran éteint) ou hors du viewport :
+    // aucune raison de consommer du GPU.
+    if (this._paused) return;
+
+    const now = performance.now();
+    // Plafond d'images par seconde. La tolérance évite de rater une frame quand
+    // le pas de l'écran ne divise pas exactement l'intervalle visé.
+    const minInterval = 1000 / this._quality.maxFps - 0.5;
+    if (now - this._lastTime < minInterval) return;
+
+    const dt = Math.min((now - this._lastTime) / 1000, 0.1);
+    this._lastTime = now;
+    const loopT0 = this._perfEl ? performance.now() : 0;
+
+    // Camera fly-to animation
+    if (this._camAnimTo && this.camera && this.controls) {
+      const arrival = Math.max(this._modelSpan * 5e-4, 1e-4);
+      const alpha = 1 - Math.exp(-dt / 0.25);
+      this.camera.position.lerp(this._camAnimTo.pos, alpha);
+      this.controls.target.lerp(this._camAnimTo.target, alpha);
+      if (
+        // Seuil relatif à l'envergure : fixé à 0,005 unité, un vol vers une vue
+        // n'arrivait jamais sur un modèle en centimètres, et la boucle de rendu
+        // restait éveillée indéfiniment — du GPU consommé pour rien sur la
+        // tablette.
+        this.camera.position.distanceTo(this._camAnimTo.pos) < arrival &&
+        this.controls.target.distanceTo(this._camAnimTo.target) < arrival
+      ) {
+        this.camera.position.copy(this._camAnimTo.pos);
+        this.controls.target.copy(this._camAnimTo.target);
+        this._camAnimTo = null;
+        this._saveView();
+      }
+      this._dirty = true;
+    }
+
+    // Ouvrants en mouvement : tant qu'une porte pivote, il faut redessiner.
+    if (this._parts.built && this._parts.update(dt)) this._dirty = true;
+    // Effets en fondu (teinte / opacité) : même contrainte de redraw.
+    if (this._effects.built && this._effects.update(dt)) this._dirty = true;
+
+    const moved = this.controls?.update() ?? false;
+    if (moved) this._dirty = true;
+    // Murs bas : ceux devant le point visé descendent, en douceur.
+    if (this._plan && this._modelRoot && this.camera && this.controls
+      && this._lowWalls.update(this.camera, this.controls.target, this._activeGroup ?? this._modelRoot, dt)) {
+      this._dirty = true;
+      // Les ombres suivent les murs qui descendent. Hors qualité haute, une
+      // seule fois quand ils ont fini de bouger : les recalculer à chaque image
+      // doublait le travail d'une tablette pendant qu'on tourne.
+      if (this._quality.anchorShadows) this._requestShadowUpdate();
+      else this._wallShadowsPending = true;
+    } else if (this._wallShadowsPending) {
+      this._wallShadowsPending = false;
+      this._requestShadowUpdate();
+    }
+    // L'effacement à travers les murs dépend du point de vue : il doit suivre
+    // la caméra, pas seulement les réglages.
+    if (moved || this._camAnimTo) this._updateXray();
+
+    if (this._editMode) this._dirty = true;
+
+    const transitioning = stepTransitions(this.anchors, dt, this._effectiveConfig);
+    if (transitioning) {
+      this._dirty = true;
+      // Une lumière dont l'intensité change modifie son ombre.
+      if (this._quality.anchorShadows) this._shadowsDirty = true;
+    }
+
+    this._cardRenderer?.update();
+
+    // Update gizmo screen-size scale each frame
+    if (this._panelGizmo?.visible && this.camera) {
+      this._panelGizmo.updateScale(this.camera);
+    }
+
+    this._refreshCameras(dt);
+
+    this._sim?.step(dt);
+    // Animate weather particles + lightning every frame regardless of simulation state
+    if (this._env?.needsStep) {
+      this._env.stepParticles(dt);
+      this._dirty = true;
+    }
+
+    if ((moved || this._dirty) && this.camera && this.canvas) {
+      const w = this.canvas.offsetWidth;
+      const h = this.canvas.offsetHeight;
+      this._updateOverlayPositions(w, h);
+    }
+
+    // Des shaders neufs se compilent en arrière-plan : on garde l'image d'avant.
+    if (!this._dirty || this._compiling) return;
+    this._dirty = false;
+
+    if (this._shadowsDirty && this.renderer) {
+      this.renderer.shadowMap.needsUpdate = true;
+      this._shadowsDirty = false;
+    }
+    const t0 = this._perfEl ? performance.now() : 0;
+    this.renderer?.render(this.scene!, this.camera!);
+    if (this._stale.length) this._disposeStale();
+    if (this._perfEl) { const end = performance.now(); this._perfTick(end - t0, end - loopT0, now); }
+  };
+
+  // ── Compteur de performances (diagnostic, sur l'appareil) ───────────────
+
+  private _wallShadowsPending = false;
+  private _perfEl: HTMLDivElement | null = null;
+  private _perfStats = { frames: 0, ms: 0, worst: 0, total: 0, since: 0 };
+
+  /** Le compteur, en haut à gauche : ce qu'il faut pour dire si une tablette suit. */
+  private _setPerfHud(on: boolean) {
+    this._perfEl?.remove();
+    this._perfEl = null;
+    if (!on || !this.overlayContainer) return;
+    const el = document.createElement('div');
+    el.className = 'ow-perf';
+    el.style.cssText = [
+      'position:absolute', 'left:8px', 'bottom:8px', 'z-index:60', 'pointer-events:none',
+      'font:11px/1.45 ui-monospace,Consolas,monospace', 'color:#e2e8f0', 'background:rgba(8,12,22,0.86)',
+      'padding:6px 9px', 'border-radius:8px', 'white-space:pre',
+    ].join(';');
+    this.overlayContainer.appendChild(el);
+    this._perfEl = el;
+    this._perfStats = { frames: 0, ms: 0, worst: 0, total: 0, since: performance.now() };
+    this._perfShow(0);
+  }
+
+  private _perfTick(renderMs: number, totalMs: number, now: number) {
+    const s = this._perfStats;
+    s.frames++;
+    s.ms += renderMs;
+    s.total += totalMs;
+    s.worst = Math.max(s.worst, totalMs);
+    if (now - s.since >= 1000) {
+      this._perfShow((s.frames * 1000) / (now - s.since));
+      s.frames = 0; s.ms = 0; s.total = 0; s.worst = 0; s.since = now;
+    }
+  }
+
+  private _perfShow(fps: number) {
+    const el = this._perfEl, r = this.renderer;
+    if (!el || !r) return;
+    const s = this._perfStats;
+    const avg = s.frames ? s.ms / s.frames : 0;
+    const total = s.frames ? s.total / s.frames : 0;
+    const size = r.getDrawingBufferSize(new THREE.Vector2());
+    const lights = [...this.anchors.values()].filter((a) => a.light?.visible).length;
+    el.textContent = [
+      `${fps.toFixed(0)} img/s · image ${total.toFixed(1)} ms (pire ${s.worst.toFixed(1)}) · dont rendu ${avg.toFixed(1)}`,
+      `${r.info.render.calls} appels · ${(r.info.render.triangles / 1000).toFixed(1)} k triangles`,
+      `${size.x}×${size.y} · DPR ${r.getPixelRatio()} · ${this.overlays.size} pastilles · ${lights} lumières`,
+      `qualité ${resolveLevel(this._effectiveConfig?.rendering?.quality)} · ombres ${r.shadowMap.enabled ? 'oui' : 'non'}`,
+      detectionLabel(),
+    ].join('\n');
+    // Au repos la carte ne dessine rien : on relit quand même une fois par seconde.
+    if (!fps) setTimeout(() => { if (this._perfEl === el && !this._perfStats.frames) this._perfShow(0); }, 1000);
+  }
+
+  /** À appeler dès que les ombres cessent d'être valides (lumière, soleil, géométrie). */
+  private _requestShadowUpdate() {
+    this._shadowsDirty = true;
+    this._dirty = true;
+  }
+
+  /**
+   * Recharge les vignettes de caméra à la cadence du profil qualité.
+   *
+   * Seules les vignettes réellement visibles sont rechargées : une image peut
+   * peser 180 Ko, et rien ne justifie de la télécharger pour un élément masqué
+   * par une condition ou situé derrière la caméra.
+   */
+  private _refreshCameras(dt: number) {
+    const interval = this._quality.cameraRefreshMs;
+    if (!interval) return;
+
+    this._camAccum += dt * 1000;
+    if (this._camAccum < interval) return;
+    this._camAccum = 0;
+
+    this.anchors.forEach((entry, name) => {
+      const ov = this.overlays.get(name);
+      if (!(ov instanceof CameraOverlay)) return;
+      if (ov.el.style.display === 'none' || ov.conditionHidden || entry.hidden) return;
+      const pic = this._hass?.states[entry.entityId]?.attributes?.entity_picture;
+      ov.setPicture(typeof pic === 'string' ? pic : undefined, true);
+    });
+  }
+
+  // ── Mise en pause hors écran ───────────────────────────────────────────
+
+  private _setupVisibility(container: HTMLElement) {
+    this._onVisibility = () => this._setPaused(document.hidden);
+    document.addEventListener('visibilitychange', this._onVisibility);
+
+    // Un dashboard mural passe souvent d'une vue à l'autre : hors du viewport,
+    // la carte n'a aucune raison de continuer à rendre.
+    if (typeof IntersectionObserver !== 'undefined') {
+      this._io = new IntersectionObserver(
+        (entries) => this._setPaused(!entries[0]?.isIntersecting),
+        { threshold: 0 },
+      );
+      this._io.observe(container);
+    }
+  }
+
+  private _setPaused(paused: boolean) {
+    if (paused === this._paused) return;
+    this._paused = paused;
+    if (!paused) {
+      // Repartir du temps courant, sinon le premier dt vaut la durée de la pause.
+      this._lastTime = performance.now();
+      this._dirty = true;
+    }
+  }
+
+  /**
+   * Cadre la caméra d'ombre du soleil sur le modèle chargé.
+   *
+   * Elle était figée sur ±15 unités : sur un modèle plus petit, la majorité des
+   * texels de la shadow map tombait à côté de la maison, ce qui donnait des
+   * ombres crénelées même en haute résolution. Ajuster le cadrage multiplie la
+   * densité de texels utiles sans coûter une frame de plus.
+   */
+  private _fitSunShadow() {
+    if (!this._sunLight || this._modelBox.isEmpty()) return;
+
+    const sphere = this._modelBox.getBoundingSphere(new THREE.Sphere());
+    const r = Math.max(1, sphere.radius) * 1.05;
+    // La lumière doit rester hors de la sphère englobante.
+    const dist = Math.max(10, r * 2);
+    this._env?.setSunDistance(dist);
+
+    const cam = this._sunLight.shadow.camera;
+    cam.left = -r;
+    cam.right = r;
+    cam.top = r;
+    cam.bottom = -r;
+    /**
+     * Plan proche et biais de l'ombre, eux aussi à l'échelle.
+     *
+     * Un `near` de 0,1 face à un `far` de près de 2 000 laisse une carte de
+     * profondeur d'ombre presque inutilisable : c'est ce qui produit l'acné —
+     * ces rayures sombres sur les surfaces éclairées.
+     *
+     * `bias` s'exprime en profondeur normalisée : sur une plage aussi étendue,
+     * une valeur fixe se traduit par un décalage monde énorme, et l'ombre se
+     * détache de l'objet. `normalBias`, lui, s'exprime en unités du monde et se
+     * met donc à l'échelle proprement.
+     */
+    cam.near = Math.max(dist * 0.05, 0.01);
+    cam.far = dist + r * 2;
+    cam.updateProjectionMatrix();
+    this._sunLight.shadow.bias = 0;
+    this._sunLight.shadow.normalBias = Math.max(this._modelSpan * 0.0015, 0.002);
+    this._sunLight.shadow.needsUpdate = true;
+  }
+
+  // ── Live settings apply ────────────────────────────────────────────────
+
+  private _applySettingsLive() {
+    this._syncRoof();
+    if (!this.renderer || !this.scene || !this.controls) return;
+    const ec = this._effectiveConfig;
+    const rl = ec.rendering ?? {};
+
+    // Exposure
+    if (rl.exposure !== undefined) {
+      this.renderer.toneMappingExposure = rl.exposure;
+    }
+    // Fog density
+    if (rl.fog_density !== undefined && this.scene.fog instanceof THREE.FogExp2) {
+      this._fitFog();
+    }
+    // Plan de coupe : relu à chaque changement de réglage, pour que le curseur
+    // agisse en direct.
+    this._applyCutaway();
+    // Shadows
+    if (rl.shadows !== undefined) {
+      this.renderer.shadowMap.enabled = rl.shadows;
+      this.renderer.shadowMap.needsUpdate = true;
+      // Propagate shadow cast/receive — skip glass/transparent materials
+      this.scene.traverse((obj) => {
+        if ((obj as THREE.Mesh).isMesh) {
+          const mat = (obj as THREE.Mesh).material as THREE.Material;
+          const isGlass = mat.transparent && mat.opacity < 0.65;
+          (obj as THREE.Mesh).castShadow = rl.shadows! && !isGlass;
+          (obj as THREE.Mesh).receiveShadow = rl.shadows!;
+        }
+      });
+    }
+    // Qualité — tout s'applique à chaud sauf l'antialias, figé à la création du
+    // contexte WebGL et donc effectif au prochain chargement de la page.
+    const qKey = qualityKey(ec);
+    if (qKey !== this._lastQualityKey) {
+      this._lastQualityKey = qKey;
+      const q = qualityFromConfig(ec);
+      this._quality = q;
+      this._ui?.setLite(resolveLevel(ec.rendering?.quality) !== 'high');
+      this._applyFloorLights();
+
+      this.renderer.setPixelRatio(Math.min(devicePixelRatio, q.maxPixelRatio));
+      this.renderer.shadowMap.type = q.shadowFilter;
+      this.renderer.shadowMap.needsUpdate = true;
+
+      // Changer mapSize ne suffit pas : la cible de rendu existante garde son
+      // ancienne taille tant qu'on ne la libère pas.
+      const resizeShadow = (
+        light: THREE.DirectionalLight | THREE.PointLight | THREE.SpotLight,
+        size: number,
+      ) => {
+        light.shadow.mapSize.set(size, size);
+        light.shadow.map?.dispose();
+        light.shadow.map = null;
+      };
+
+      if (this._sunLight) resizeShadow(this._sunLight, q.sunShadowMap);
+      this.anchors.forEach(({ light }) => {
+        // RectAreaLight n'a pas d'ombres WebGL classiques.
+        if (!light || light instanceof THREE.RectAreaLight) return;
+        light.castShadow = q.anchorShadows;
+        resizeShadow(light, q.anchorShadowMap);
+      });
+
+      // Le filtre d'ombre est compilé dans les shaders : sans cela, les
+      // matériaux déjà compilés gardent l'ancien.
+      this.scene.traverse((obj) => {
+        const mat = (obj as THREE.Mesh).material;
+        if (Array.isArray(mat)) mat.forEach((m) => { m.needsUpdate = true; });
+        else if (mat) (mat as THREE.Material).needsUpdate = true;
+      });
+
+      this._cardRenderer?.setTextureWidth(q.cardTextureWidth);
+      this._env?.rebuildWeather();
+    }
+
+    // Ground color
+    if (rl.ground_color !== undefined) {
+      this._env?.updateGroundColor(rl.ground_color);
+    }
+    // Transparent background
+    if (rl.transparent_background !== undefined) {
+      const transparent = rl.transparent_background;
+      const bgHex = rl.background_color ? parseInt(rl.background_color.replace('#', ''), 16) : 0x0d1117;
+      if (transparent) {
+        this.scene.background = null;
+        this.renderer.setClearColor(0x000000, 0);
+        this.scene.fog = null;
+        // Remove ground when transparent (no surface needed)
+        this._env?.removeGround();
+      } else {
+        const useSky = rl.sky !== false;
+        this.scene.background = useSky ? null : new THREE.Color(bgHex);
+        this.renderer.setClearColor(bgHex, 1);
+        this.scene.fog = new THREE.FogExp2(0x9fc8e8, rl.fog_density ?? 0.018);
+        this._fitFog();
+        // Re-add ground if it was removed and model is loaded
+        if (this._modelRoot && this._env && !this._env.hasGround) {
+          const box = new THREE.Box3().setFromObject(this._modelRoot);
+          this._env.addGround(box, ec);
+        }
+      }
+    }
+    // Le ciel peint (ou le retour au ciel physique) se repose au même soleil.
+    if (rl.transparent_background !== true) this._env?.refreshSky();
+    // Sun / ambient intensities are now applied as multipliers inside
+    // applySunLight(), so we don't set them directly here — updateFromHass
+    // at the end will pick up the new config values.
+
+    // Light occlusion — add/remove invisible shadow-casting roof
+    if (this._env && this._modelRoot) {
+      const wantOcclusion = rl.light_occlusion === 'top';
+      if (wantOcclusion && !this._env.hasOcclusion) {
+        this._env.addOcclusion(this._modelBox);
+      } else if (!wantOcclusion && this._env.hasOcclusion) {
+        this._env.removeOcclusion();
+      }
+    }
+    // Ground style — rebuild ground only when ground-related settings change
+    if (this._env && this._modelRoot && rl.transparent_background !== true) {
+      const groundKey = `${rl.ground_style ?? 'square'}|${rl.ground_scale ?? 1}|${rl.ground_color ?? ''}|${rl.garden ?? 'none'}`;
+      if (groundKey !== this._lastGroundKey) {
+        this._lastGroundKey = groundKey;
+        const box = new THREE.Box3().setFromObject(this._modelRoot);
+        this._env.addGround(box, ec);
+      }
+    }
+    // Orbit limits
+    const orb = ec.orbit ?? {};
+    if (orb.min_distance !== undefined) this.controls.minDistance = orb.min_distance;
+    if (orb.max_distance !== undefined) this.controls.maxDistance = orb.max_distance;
+    if (orb.max_polar_angle !== undefined) this.controls.maxPolarAngle = orb.max_polar_angle * Math.PI;
+
+    this._syncReflections();
+
+    // Re-apply environment: sun mode, orientation, intensities via applySunLight
+    if (this._env) {
+      // If simulation is active, re-apply it (it calls applySunLight internally)
+      if (this._sim?.isActive) {
+        this._sim.applySimulation();
+      } else if (this._hass) {
+        this._env.updateFromHass(this._hass);
+      }
+    }
+
+    this._requestShadowUpdate();
+  }
+
+  /**
+   * Donne aux métaux l'image à refléter, ou la retire.
+   *
+   * Champ vide : la pièce procédurale, sans téléchargement. Une URL .hdr
+   * remplace cette pièce. L'intensité et le seuil ne refont pas le PMREM.
+   * Décocher ne le libère pas : c'est le démontage de la carte, comme avant.
+   */
+  private _syncReflections() {
+    const root = this._modelRoot;
+    const renderer = this.renderer;
+    if (!root || !renderer) return;
+    const rendering = this._effectiveConfig.rendering;
+    const intensity = reflectionIntensity(rendering?.reflection_intensity);
+    const metalness = reflectionMetalness(rendering?.reflection_metalness);
+    const url = reflectionHdriUrl(rendering?.reflection_hdri);
+
+    if (this._reflectionWarned !== null && this._reflectionWarned !== url) {
+      this._reflectionWarned = null;
+    }
+    // Une autre adresse peut être réessayée. La même, déjà en échec, non.
+    if (this._reflectionFailed !== null && this._reflectionFailed !== url) {
+      this._reflectionFailed = null;
+    }
+    if (url === null && this._reflectionPending !== null) {
+      this._cancelReflectionLoad();
+    }
+
+    if (rendering?.reflections !== true) {
+      this._hideReflections(root, url, intensity, metalness);
+      return;
+    }
+
+    // Un autre suffixe n'est pas un RGBE : on n'essaie pas de le lire.
+    if (url && !isReflectionHdr(url) && this._reflectionFailed !== url) {
+      this._warnReflectionHdri(url, 'format');
+      this._reflectionFailed = url;
+      this._cancelReflectionLoad();
+    }
+
+    const action = reflectionUpdate(
+      this._reflectionBuilt,
+      this._reflectionPending,
+      this._reflectionFailed,
+      rendering?.reflection_hdri,
+    );
+    if (action === 'load' && url) {
+      this._loadReflectionHdri(url, renderer, root, intensity, metalness);
+      return;
+    }
+    if (action === 'keep' && this._reflectionTarget) {
+      const map = this._reflectionTarget.texture;
+      assignReflectionMap(root, map, map, intensity, metalness);
+      return;
+    }
+    if (url === null || (this._reflectionPending !== null && this._reflectionPending !== url)) {
+      this._cancelReflectionLoad();
+    }
+    this._useProceduralReflection(renderer, root, intensity, metalness);
+  }
+
+  /**
+   * Décoche : on retire l'image des métaux, on garde le PMREM.
+   *
+   * Il ne part que si l'adresse a changé. L'extinction définitive est le
+   * démontage de la carte, le même chemin qu'avant.
+   */
+  private _hideReflections(root: THREE.Object3D, url: string | null, intensity: number, metalness: number) {
+    const previous = this._reflectionTarget?.texture ?? null;
+    assignReflectionMap(root, null, previous, intensity, metalness);
+    if (this._reflectionPending !== null && this._reflectionPending !== url) {
+      this._cancelReflectionLoad();
+    }
+    // Le chargement en cours a une pièce en attente : ce n'est pas une image périmée.
+    if (this._reflectionPending === url && url !== null) return;
+    const wanted = url ?? '';
+    if (this._reflectionBuilt !== null && this._reflectionBuilt !== wanted) {
+      this._releaseReflectionTarget();
+    }
+  }
+
+  /** Pièce procédurale. Déjà en place : on ne refait que l'affectation. */
+  private _useProceduralReflection(
+    renderer: THREE.WebGLRenderer,
+    root: THREE.Object3D,
+    intensity: number,
+    metalness: number,
+  ) {
+    if (this._reflectionBuilt === '' && this._reflectionTarget) {
+      const map = this._reflectionTarget.texture;
+      assignReflectionMap(root, map, map, intensity, metalness);
+      return;
+    }
+    const previous = this._reflectionTarget;
+    const target = createRoomEnvironment(renderer);
+    this._reflectionTarget = target;
+    this._reflectionBuilt = '';
+    assignReflectionMap(root, target.texture, previous?.texture ?? null, intensity, metalness);
+    previous?.dispose();
+  }
+
+  private _loadReflectionHdri(
+    url: string,
+    renderer: THREE.WebGLRenderer,
+    root: THREE.Object3D,
+    intensity: number,
+    metalness: number,
+  ) {
+    // L'ancien fichier part tout de suite. La pièce tient les métaux
+    // le temps du téléchargement, pour qu'ils ne passent pas au noir.
+    if (!this._reflectionTarget || this._reflectionBuilt !== '') {
+      this._useProceduralReflection(renderer, root, intensity, metalness);
+    } else {
+      const map = this._reflectionTarget.texture;
+      assignReflectionMap(root, map, map, intensity, metalness);
+    }
+    const token = ++this._reflectionToken;
+    this._reflectionPending = url;
+    this._reflectionFailed = null;
+    new RGBELoader().load(
+      url,
+      (texture) => this._onReflectionHdriLoaded(token, url, texture),
+      undefined,
+      (err) => this._onReflectionHdriError(token, url, err),
+    );
+  }
+
+  private _onReflectionHdriLoaded(token: number, url: string, texture: THREE.Texture) {
+    if (token !== this._reflectionToken) {
+      texture.dispose();
+      return;
+    }
+    const renderer = this.renderer;
+    const rendering = this._effectiveConfig.rendering;
+    if (!renderer || reflectionHdriUrl(rendering?.reflection_hdri) !== url) {
+      if (this._reflectionPending === url) this._reflectionPending = null;
+      texture.dispose();
+      return;
+    }
+    let target: THREE.WebGLRenderTarget;
+    try {
+      target = createHdriEnvironment(renderer, texture);
+    } catch (err) {
+      this._onReflectionHdriError(token, url, err);
+      return;
+    }
+    const previous = this._reflectionTarget;
+    this._reflectionTarget = target;
+    this._reflectionBuilt = url;
+    this._reflectionPending = null;
+    this._reflectionFailed = null;
+    const root = this._modelRoot;
+    if (rendering?.reflections === true && root) {
+      assignReflectionMap(
+        root,
+        target.texture,
+        previous?.texture ?? null,
+        reflectionIntensity(rendering.reflection_intensity),
+        reflectionMetalness(rendering.reflection_metalness),
+      );
+      this._requestRender();
+    }
+    if (previous && previous !== target) previous.dispose();
+  }
+
+  private _onReflectionHdriError(token: number, url: string, detail?: unknown) {
+    if (token !== this._reflectionToken) return;
+    this._reflectionPending = null;
+    this._reflectionFailed = url;
+    this._warnReflectionHdri(url, 'load', detail);
+    const root = this._modelRoot;
+    const renderer = this.renderer;
+    const rendering = this._effectiveConfig.rendering;
+    if (!root || !renderer || rendering?.reflections !== true) return;
+    this._useProceduralReflection(
+      renderer,
+      root,
+      reflectionIntensity(rendering.reflection_intensity),
+      reflectionMetalness(rendering.reflection_metalness),
+    );
+    this._requestRender();
+  }
+
+  private _warnReflectionHdri(url: string, reason: 'format' | 'load', detail?: unknown) {
+    if (this._reflectionWarned === url) return;
+    this._reflectionWarned = url;
+    const message = reason === 'format'
+      ? `[Houscape] Reflection HDRI ignored (${url}): only an equirectangular .hdr is supported; using the procedural room.`
+      : `[Houscape] Reflection HDRI failed to load (${url}); using the procedural room.`;
+    if (detail === undefined) console.warn(message);
+    else console.warn(message, detail);
+  }
+
+  private _cancelReflectionLoad() {
+    this._reflectionToken++;
+    this._reflectionPending = null;
+  }
+
+  private _releaseReflectionTarget() {
+    this._reflectionTarget?.dispose();
+    this._reflectionTarget = null;
+    this._reflectionBuilt = null;
+  }
+
+  /**
+   * Adapte les bornes d'orbite à l'échelle du modèle.
+   *
+   * Les valeurs par défaut (1 à 100) supposaient un modèle en mètres. Un export
+   * Sweet Home 3D est en centimètres : une maison de six mètres mesure alors
+   * 600 unités, et la caméra restait épinglée à un mètre du centre — on ne
+   * voyait qu'un mur et du ciel.
+   *
+   * Les bornes explicitement fournies par la scène sont respectées : c'est un
+   * réglage, pas une supposition.
+   */
+  /**
+   * Densité du brouillard, ramenée à l'échelle du modèle.
+   *
+   * `FogExp2` s'exprime par unité de distance : une densité de 0,018, réglée
+   * pour un modèle en mètres, sature entièrement un modèle en centimètres —
+   * à 300 unités le facteur vaut déjà 1, et la maison disparaît dans un aplat
+   * bleu. Le symptôme est trompeur : on croit à un modèle qui ne charge pas.
+   *
+   * Le réglage de l'éditeur garde son sens : il décrit la densité voulue pour
+   * un modèle d'une dizaine d'unités, et on la transpose.
+   */
+  private _fitFog() {
+    const fog = this.scene?.fog;
+    if (!(fog instanceof THREE.FogExp2)) return;
+    const asked = this._effectiveConfig.rendering?.fog_density ?? 0.018;
+    // Même référence que le reste du projet : voir scale.ts. Cette ligne
+    // utilisait un 10 écrit en dur, légèrement différent, pour la même intention.
+    fog.density = asked / modelScale(this._modelSpan);
+  }
+
+  /**
+   * Applique le plan de coupe horizontal.
+   *
+   * Un plan de découpe global du renderer s'applique à tous les matériaux sans
+   * qu'il faille les toucher un par un, et il agit dans le nuanceur : aucun
+   * triangle n'est analysé, aucun « mur extérieur » n'a besoin d'être
+   * identifié. Cela fonctionne donc sur un export fusionné comme sur un modèle
+   * découpé.
+   *
+   * Les overlays sont du DOM : ils restent visibles, ce qui est cohérent avec
+   * le choix de laisser les pastilles traverser les murs.
+   */
+  /**
+   * Applique le réglage d'effacement.
+   *
+   * L'instrumentation des matériaux n'a lieu qu'une fois ; ensuite tout passe
+   * par des uniformes partagés, donc changer le réglage ne recompile rien.
+   */
+  private _applyCutaway() {
+    if (!this._modelRoot || !this.scene) return;
+    instrumentMaterials(this._modelRoot, this._cutaway);
+
+    const on = (this._effectiveConfig.rendering?.xray ?? 0) > 0;
+    if (on && !this._ghost) {
+      this._ghost = createGhost(this._modelRoot, this._cutaway);
+      this.scene.add(this._ghost);
+    } else if (!on && this._ghost) {
+      this.scene.remove(this._ghost);
+      this._ghost = null;
+    }
+
+    this._updateXray();
+    this._requestRender();
+  }
+
+  /**
+   * Recalage de l'effacement sur la caméra.
+   *
+   * Appelé à chaque image où la caméra a bougé : trois écritures d'uniformes,
+   * quel que soit le nombre de matériaux du modèle.
+   */
+  private _updateXray() {
+    if (!this.camera || !this.controls) return;
+    // Rayon de la sphère englobante : c'est l'échelle naturelle du dégagement.
+    const radius = this._modelBox.getBoundingSphere(new THREE.Sphere()).radius;
+    updateXray(
+      this._cutaway,
+      this.camera,
+      this.controls.target,
+      this._effectiveConfig.rendering?.xray ?? 0,
+      radius,
+    );
+  }
+
+  /**
+   * Vue d'ensemble : tout le modèle dans le cadre, vu de trois quarts en
+   * plongée, comme on regarde une maquette posée sur une table.
+   *
+   * La distance se calcule depuis la sphère englobante et le champ de vision
+   * le plus étroit (vertical en paysage, horizontal en portrait) : le cadrage
+   * tient quelle que soit l'échelle du modèle, mètres comme centimètres.
+   */
+  private _frameModel(animate = false) {
+    if (!this.camera || !this.controls) return;
+    const size = this._modelBox.getSize(new THREE.Vector3());
+    const radius = Math.max(size.length() / 2, 1e-3);
+    const vfov = (this.camera.fov * Math.PI) / 180;
+    // Seule la partie de la carte que l'éditeur de plan ne couvre pas compte.
+    const visible = this.canvas?.clientWidth ? 1 - Math.abs(this._viewShift) / this.canvas.clientWidth : 1;
+    const hfov = 2 * Math.atan(Math.tan(vfov / 2) * this.camera.aspect * Math.max(visible, 0.2));
+    const dist = (radius / Math.sin(Math.min(vfov, hfov) / 2)) * 0.85;
+
+    const elevation = (50 * Math.PI) / 180;
+    const azimuth = (25 * Math.PI) / 180;
+    const dir = new THREE.Vector3(
+      Math.sin(azimuth) * Math.cos(elevation),
+      Math.sin(elevation),
+      Math.cos(azimuth) * Math.cos(elevation),
+    );
+    // Un modèle Z-up (export brut de Blender) se regarde d'au-dessus de Z.
+    if (verticalAxis(this._modelBox) === 2) dir.set(dir.x, -dir.z, dir.y);
+
+    // La borne d'orbite ne doit pas rogner la vue d'ensemble.
+    if (this.controls.maxDistance < dist * 1.2) this.controls.maxDistance = dist * 1.2;
+    // Le centre de la maison : l'origine pour un modèle importé (recentré au
+    // chargement), pas forcément pour un plan qui a grandi depuis son origine.
+    const centre = this._modelBox.isEmpty() ? new THREE.Vector3() : this._modelBox.getCenter(new THREE.Vector3());
+    centre.y = 0;
+    if (animate) {
+      this._camAnimTo = { pos: centre.clone().add(dir.multiplyScalar(dist)), target: centre };
+      this._ui?.setActiveView(null);
+      this._ui?.setActiveRoom(null);
+      this._requestRender();
+      return;
+    }
+    this.controls.target.copy(centre);
+    this.camera.position.copy(centre).add(dir.multiplyScalar(dist));
+    this.camera.lookAt(centre);
+    this.controls.update();
+  }
+
+  private _fitOrbitLimits() {
+    if (!this.controls) return;
+    const settings = this._scene?.settings?.orbit ?? {};
+    const span = this._modelSpan;
+    if (span <= 0) return;
+
+    if (settings.min_distance === undefined) this.controls.minDistance = span * 0.05;
+    if (settings.max_distance === undefined) this.controls.maxDistance = span * 3;
+
+    /**
+     * Plans de coupe.
+     *
+     * Le plan proche gouverne toute la précision de la profondeur : elle se
+     * dégrade comme le carré de la distance divisé par lui. Le coller à zéro
+     * — ce que faisait un `span * 1e-4` — réduisait la discrimination à
+     * plusieurs millimètres à l'autre bout de la maison, et faisait scintiller
+     * les surfaces proches.
+     *
+     * On le cale donc sur la distance minimale d'orbite : la caméra ne peut
+     * jamais s'en approcher davantage, rien ne sera coupé.
+     */
+    if (this.camera) {
+      this.camera.near = Math.max(this.controls.minDistance * 0.1, span * 1e-3);
+      this.camera.far = Math.max(span * 8, this.camera.near * 1e4);
+      this.camera.updateProjectionMatrix();
+    }
+    this.controls.update();
+  }
+
+  // ── Ouvrants ──────────────────────────────────────────────────────────
+
+  /**
+   * Détache les ouvrants décrits par la scène et les place selon l'état courant.
+   *
+   * Appelé après le chargement du modèle, et à chaque modification dans
+   * l'éditeur — détacher une pièce modifie la géométrie de base, donc on repart
+   * toujours d'un modèle propre plutôt que d'essayer de défaire un retrait.
+   */
+  /** Fusionne les objets immobiles, sauf en édition. */
+  /**
+   * Un étage vu pour la première fois apporte des matières neuves (toit,
+   * trémie, dalles) : compilées au premier dessin, elles figeaient la carte un
+   * quart de seconde sur le PC de dev, bien plus sur une tablette. On les
+   * compile en arrière-plan, en gardant l'image précédente à l'écran.
+   */
+  private _compiling = false;
+  private _compileToken = 0;
+
+  private _compileInBackground() {
+    const r = this.renderer, scene = this.scene, camera = this.camera;
+    if (!r || !scene || !camera) return;
+    const token = ++this._compileToken;
+    this._compiling = true;
+    const done = () => {
+      if (token !== this._compileToken) return;
+      this._compiling = false;
+      this._requestRender();
+    };
+    // Garde-fou : jamais plus d'une seconde et demie sans image.
+    setTimeout(done, 1500);
+    r.compileAsync(scene, camera).then(done, done);
+  }
+
+  /** Ce que la dernière reconstruction a retiré, à jeter après la prochaine image. */
+  private _stale: THREE.Object3D[] = [];
+
+  private _disposeStale() {
+    const dispose = (o: THREE.Object3D) => {
+      // Les meubles partagent la géométrie et les matières de leur modèle en cache.
+      if (o.name === 'plan_items') return;
+      const mesh = o as THREE.Mesh;
+      // Maillages, mais aussi les traits (arêtes du toit) : tout ce qui a une géométrie.
+      // Les matières, elles, ne sont pas jetées : le ramasse-miettes s'en charge.
+      // Les jeter libérerait leurs shaders, que la carte graphique recompilerait
+      // au retour sur cet étage (un toit, une trémie n'existent qu'à certains
+      // niveaux). Le nombre de shaders reste borné : un par sorte de matière.
+      if (mesh.geometry && (mesh.isMesh || (o as THREE.LineSegments).isLineSegments)) mesh.geometry.dispose();
+      o.children.forEach(dispose);
+    };
+    const stale = this._stale;
+    this._stale = [];
+    stale.forEach(dispose);
+  }
+
+  /** Un glissé est en cours dans le plan : la maison est reconstruite souvent, on ne regroupe rien. */
+  private _planPreviewing = false;
+
+  private _mergeStatic() {
+    if (!this._batch || this._editMode || this._planPreviewing) return;
+    const n = this._batch.merge();
+    // Les regroupements neufs portent les murs : leur matière et leur ombre suivent les murs bas.
+    if (this._modelRoot) this._lowWalls.instrument(this._modelRoot);
+    if (n) {
+      console.debug(`[Houscape] ${n} static objects merged`);
+      this._requestShadowUpdate();
+    }
+  }
+
+  private _buildParts() {
+    // Un ouvrant peut changer de pièce : on repart des objets d'origine, et on
+    // refusionne une fois les ouvrants (et effets) montés.
+    this._batch?.unmerge();
+    try {
+      this._mountParts();
+      // Les hôtes émissifs doivent rester hors fusion, comme les ouvrants.
+      if (this._modelRoot) this._lightEmissive.markHosts(this._modelRoot, this.anchors.values());
+      this._mountEffects();
+    } catch (err) {
+      // Ouvrants / effets ne doivent jamais laisser la carte sans modèle :
+      // _loadModel a déjà vidé la scène précédente.
+      console.error('[Houscape] openings/effects setup failed; model kept without them:', err);
+    } finally {
+      this._mergeStatic();
+    }
+  }
+
+  private _mountParts() {
+    const root = this._modelRoot;
+    if (!root) return;
+    // Les portes d'un étage qui n'est pas construit attendent leur étage, sans bruit.
+    const configs = (this._scene?.parts ?? []).filter((p) =>
+      !(p.node?.startsWith('plan_leaf_') && this._plan?.floors?.length && !root.getObjectByName(p.node)));
+    // Les rangs de l'arborescence se relèvent sur le modèle tel que chargé,
+    // avant qu'un ouvrant ne déplace quoi que ce soit.
+    stampOrder(root);
+    // Les calques de surlignage ne doivent pas entrer dans une boîte d'ouvrant.
+    this._highlight.clear();
+    this._parts.dispose(root);
+    if (configs.length === 0) { this._applyHighlight(); return; }
+
+    // Déduite du modèle entier, pas de chaque pièce : voir verticalAxis().
+    this._parts.setVertical(verticalAxis(this._modelBox));
+    const { missing } = this._parts.build(root, configs);
+    if (missing.length) {
+      console.warn(
+        `[Houscape] ${missing.length} opening(s) not found in the model:`,
+        missing.map((m) => m.label || m.entity).join(', '),
+      );
+    }
+    if (this._hass) this._parts.applyStates(this._hass.states);
+    // Les ouvrants partent de leur position fermée : on les amène d'un coup à
+    // leur état réel, sinon toutes les portes ouvertes s'animeraient au
+    // chargement de la page.
+    this._parts.update(1e6);
+  }
+
+  private _mountEffects() {
+    const configs = Array.isArray(this._scene?.effects) ? this._scene!.effects! : [];
+    if (!this._modelRoot) return;
+    this._effects.dispose();
+    if (configs.length === 0) { this._applyHighlight(); return; }
+    const { missing } = this._effects.build(this._modelRoot, configs);
+    if (missing.length) {
+      console.warn(
+        `[Houscape] ${missing.length} effect(s) not found in the model:`,
+        missing.map((m) => m.label || m.entity).join(', '),
+      );
+    }
+    try {
+      if (this._hass) this._effects.applyStates(this._hass.states);
+    } catch (err) {
+      console.warn('[Houscape] effects applyStates failed:', err);
+    }
+    this._applyHighlight();
+  }
+
+  private _rebuildEffects() {
+    if (!this._modelRoot) return;
+    this._batch?.unmerge();
+    try {
+      this._mountEffects();
+    } catch (err) {
+      console.error('[Houscape] effects rebuild failed:', err);
+    } finally {
+      this._mergeStatic();
+    }
+  }
+
+  /**
+   * Reconstruit les ouvrants après une modification dans l'éditeur.
+   *
+   * Sur place, sans recharger le modèle : tout montage se défait exactement
+   * (triangles rendus à leur maille, nœuds remis sous leur parent). Recharger
+   * quittait aussi le mode édition — et fermait le formulaire qu'on venait
+   * d'ouvrir sur un nouvel ouvrant.
+   */
+  refreshParts() {
+    if (!this._modelRoot) return;
+    this._buildParts();
+  }
+
+  // ── Scene content cleanup (keeps renderer/canvas/HUD intact) ─────────
+
+  private _clearSceneContent() {
+    // Exit edit mode cleanly
+    if (this._editMode) this._exitEditMode();
+    this._batch?.unmerge();
+    this._batch = null;
+    this._highlight.clear();
+    this._lightEmissive.dispose();
+    this._parts.dispose(this._modelRoot ?? undefined);
+    this._effects.dispose();
+    if (this._ghost) { this.scene?.remove(this._ghost); this._ghost = null; }
+    // Dispose card renderer
+    this._cardRenderer?.dispose();
+    this._cardRenderer = null;
+    this._panelGizmo?.dispose();
+    this._panelGizmo = null;
+    // Remove overlays & clusters
+    this._clusters.forEach((c) => c.destroy());
+    this._clusters.clear();
+    this.overlays.forEach((o) => o.destroy());
+    this.overlays.clear();
+    // Remove lights created by anchors
+    this.anchors.forEach((e) => {
+      if (e.light) { this.scene?.remove(e.light); e.light.dispose(); }
+      if (e.lightTarget) this.scene?.remove(e.lightTarget);
+    });
+    this.anchors.clear();
+    // Remove ground, occlusion, weather particles
+    this._env?.removeGround();
+    this._env?.removeOcclusion();
+    this._env?.removeWeatherParticles();
+    // Remove 3D model
+    if (this._modelRoot && this.scene) {
+      this.scene.remove(this._modelRoot);
+      this._modelRoot.traverse((obj) => {
+        if ((obj as THREE.Mesh).isMesh) {
+          (obj as THREE.Mesh).geometry.dispose();
+          const mat = (obj as THREE.Mesh).material;
+          if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+          else (mat as THREE.Material).dispose();
+        }
+      });
+    }
+    this._modelRoot = null;
+    this.modelLoaded = false;
+    this._lastGroundKey = '';
+    // Reset simulation
+    this._sim = null;
+    this._viewMgr = null;
+    this._ruleEngine.reset();
+  }
+
+  // ── Model loading ─────────────────────────────────────────────────────
+
+  private async _loadModel() {
+    // Clean up any previous scene content before loading new model
+    this._clearSceneContent();
+    // Sans réponse de l'intégration, la démo laisserait croire la scène perdue.
+    if (this._backendDown && !this._config?.model_url?.trim()) {
+      this._showBackendDown();
+      return;
+    }
+    const ec = this._effectiveConfig;
+    const plan = this._plan;
+    if ((!ec.model_url && !plan) || !this.scene) return;
+
+    // Show loading indicator
+    const loadingEl = document.createElement('div');
+    loadingEl.style.cssText = [
+      'position:absolute', 'inset:0', 'display:flex', 'flex-direction:column',
+      'align-items:center', 'justify-content:center', 'z-index:50',
+      'pointer-events:none', 'gap:10px',
+    ].join(';');
+    loadingEl.innerHTML = `
+      <div style="width:32px;height:32px;border:3px solid rgba(255,255,255,0.12);border-top-color:rgba(125,209,252,0.8);border-radius:50%;animation:houscape-spin 0.8s linear infinite;"></div>
+      <div style="font-size:11px;color:rgba(255,255,255,0.35);font-family:var(--primary-font-family,sans-serif);letter-spacing:.04em;">${t('modelLoading')}</div>
+    `;
+    const styleEl = document.createElement('style');
+    styleEl.textContent = '@keyframes houscape-spin{to{transform:rotate(360deg)}}';
+    loadingEl.appendChild(styleEl);
+    this.overlayContainer?.appendChild(loadingEl);
+
+    let model: THREE.Group;
+    let groundBox: THREE.Box3 | null = null;
+    try {
+      if (plan) {
+        this._restoreFloor();
+        const house = buildHouse(plan, this._floorIndex());
+        model = house.root;
+        groundBox = house.groundBox;
+      } else {
+        model = await loadGLTF(ec.model_url!);
+      }
+    } catch (err) {
+      console.error('[Houscape] model load failed:', err);
+      // Le code HTTP dit s'il faut corriger le chemin ou regarder le serveur ;
+      // on le garde à l'écran, c'est lui qu'on demandera dans un rapport de bug.
+      const status = httpStatus(err);
+      const reason = `${t(modelErrorKey(err))}${status !== null ? ` (${status})` : ''}`;
+      loadingEl.innerHTML = `<div style="font-size:11px;color:#f87171;font-family:var(--primary-font-family,sans-serif);text-align:center;padding:0 16px;">⚠ ${reason}</div>`;
+      return;
+    }
+    loadingEl.remove();
+    if (this._isDemo) this._showDemoBanner();
+
+    try {
+      // Enable shadows on all meshes — but skip transparent/glass materials
+      // so that windows let light (and shadows) pass through.
+      model.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          const mat = obj.material as THREE.Material;
+          const isGlass = mat.transparent && mat.opacity < 0.65;
+          obj.castShadow = !isGlass;
+          obj.receiveShadow = true;
+        }
+      });
+
+      const box = new THREE.Box3().setFromObject(model);
+      // Un plan se centre sur son rez-de-chaussée seul : monter d'un étage ne
+      // doit pas déplacer ce qui est déjà posé.
+      const centre = (groundBox ?? box).getCenter(new THREE.Vector3());
+      if (plan) {
+        // Un plan garde son origine : le recentrer à chaque retouche ferait
+        // glisser les ancres déjà posées (voir PlanDoc.origin).
+        const o = this._planOrigin(plan);
+        centre.x = o.x;
+        centre.z = o.y;
+      }
+      model.position.sub(centre);
+      this._modelBox.copy(box).translate(centre.negate());
+      const span = this._modelBox.getSize(new THREE.Vector3());
+      this._modelSpan = Math.max(span.x, span.y, span.z, 1e-3);
+      this._fitSunShadow();
+      this._requestShadowUpdate();
+
+      // Un export Sweet Home 3D empile son terrain, le sol de chaque pièce et le
+      // dessous des tapis à la même altitude. Strictement coplanaires, ces plans
+      // scintillent quelle que soit la précision du tampon de profondeur : on les
+      // écarte d'une fraction imperceptible plutôt que d'en supprimer un, car le
+      // terrain déborde du sol et son retrait laisserait un trou.
+      const lifted = separateCoplanarSlabs(model, this._modelSpan, verticalAxis(this._modelBox));
+      if (lifted) {
+        console.debug(`[Houscape] ${lifted} coplanar surface(s) separated`);
+      }
+      // Avant tout placement de caméra : une borne trop serrée écrêterait la
+      // position par défaut, et l'élargir ensuite ne la replacerait pas.
+      this._fitOrbitLimits();
+      this._applyCutaway();
+
+      const saved = this._loadView();
+      if (saved && this._viewFits(saved)) {
+        this.camera!.position.fromArray(saved.pos);
+        this.controls!.target.fromArray(saved.target);
+        this._toggleLock(saved.locked);
+      } else {
+        this._frameModel();
+        this._ui?.refreshDock();
+      }
+
+      this._fitFog();
+
+      this.controls!.update();
+      this.scene.add(model);
+      this._modelRoot = model;
+      if (plan) {
+        this._refreshFloorGroup(model);
+        this._lowWalls.setPlan(this._activeDoc() ?? plan, this._activeGroup ?? model);
+        this._lowWalls.instrument(model);
+      }
+      this._paintLowWallsBtn();
+      if (ec.rendering?.transparent_background !== true && this._env) {
+        this._env.addGround(box, ec);
+      }
+      // Add occlusion plane if configured
+      if (ec.rendering?.light_occlusion === 'top' && this._env) {
+        this._env.addOcclusion(this._modelBox);
+      }
+
+      this._batch = new StaticBatch(model);
+      if (plan) this._placeFurniture(model, plan);
+      if (plan && this._syncPlanPartsAfterLoad && this._scene) {
+        this._syncPlanPartsAfterLoad = false;
+        this._scene = {
+          ...this._scene,
+          parts: syncPlanParts(model, allOpenings(plan), this._scene.parts ?? [], this._planPartLabel),
+        };
+      }
+      // Ancres avant le merge : les hôtes émissifs doivent être marqués d'abord.
+      this.anchors = detectAnchors(model, this.scene, ec, this._modelSpan);
+      this._ovPosPool.clear();
+      this._applyAttachPositions();
+      this._buildParts();
+      this._applyFloorLights();
+      this._createOverlays();
+
+      this._overlaysVisible = !(ec.tap_to_toggle ?? false);
+
+      // Le renderer a été créé avant que la scène ne soit chargée, donc avec les
+      // seuls réglages du YAML. On applique ici ceux qui viennent de la scène
+      // (qualité, exposition, brouillard…), sinon ils n'auraient d'effet qu'après
+      // une modification manuelle dans l'éditeur.
+      this._applySettingsLive();
+
+      this.modelLoaded = true;
+      if (this._hass) {
+        syncLights(this.anchors, this._hass, ec, this._modelSpan);
+        this._lightEmissive.sync(model, this.anchors, this._hass);
+        this._updateOverlayStates();
+        this._evaluatePassiveConditions();
+        this._env?.updateFromHass(this._hass);
+        // Amorce le moteur : sans cela, la premiere mise a jour d'etat apres le
+        // chargement serait consommee par l'instantane initial.
+        this._evaluateRules();
+      }
+
+      // Instantiate SimulationPanel (embedded in Weather tab — no HUD button/expand needed)
+      if (!this._sim) {
+        this._sim = new SimulationPanel(
+          null,
+          null,
+          this._env!,
+          () => this._requestRender(),
+          () => this._hass,
+          () => this.anchors,
+          () => this._effectiveConfig,
+          () => this._updateOverlayStates(),
+          () => this._modelSpan,
+        );
+      }
+
+      // Instantiate ViewManager
+      this._viewMgr = new ViewManager(
+        this.overlayContainer!,
+        this._hudLeft!,
+        this._hudSep!,
+        () => this.camera,
+        () => this.controls,
+        () => this._effectiveConfig,
+        () => this._hass,
+        () => this._getActiveSceneId(),
+        () => this._scene,
+        (scene) => { this._scene = scene; this._ui?.refreshViews(); },
+        (msg, err) => this._showToast(msg, err),
+        (pos, target) => {
+          // Une vue prise à un autre étage : on y monte (ou descend) d'abord,
+          // sinon la caméra irait dans un étage qui n'est pas construit.
+          if (this._plan?.floors?.length && !this._editMode && !this._planEditor) {
+            const k = this._floorOfY(target.y);
+            if (k !== this._floorIndex()) this._setFloor(k);
+          }
+          this._camAnimTo = { pos, target };
+        },
+        () => this._hudRight,
+        () => this._hudViews,
+      );
+
+      this._rebuildNormalHUD();
+      this._ui?.refreshStatus();
+      this._ui?.refreshRooms();
+      if (!tourSeen() && !this._editMode && !this._planEditor && !this.overlayContainer?.querySelector('#houscape-demo-banner')) this._ui?.showHello();
+
+      // Sync cards from scene
+      const cards = this._scene?.cards ?? [];
+      if (cards.length > 0) {
+        this._cardRenderer?.syncCards(cards, this._hass);
+      }
+
+      this._requestRender();
+    } catch (err) {
+      // Le GLB est déjà là : une panne d'ancres / ouvrants / effets ne doit pas
+      // laisser `_modelRoot` null ni bloquer tout nouvel essai de chargement.
+      console.error('[Houscape] model setup failed after GLB load:', err);
+      if (!this._modelRoot && this.scene) {
+        this.scene.add(model);
+        this._modelRoot = model;
+      }
+      this.modelLoaded = !!this._modelRoot;
+      this._requestRender();
+    }
+  }
+
+  // ── Overlay positioning + clustering ──────────────────────────────────
+
+  /**
+   * Collections de travail du placement des pastilles, vidées à chaque image
+   * plutôt que recréées : sur une tablette, cinq collections et un objet par
+   * pastille à chaque image finissaient en à-coups du ramasse-miettes.
+   */
+  private _ovPos = new Map<string, { x: number; y: number }>();
+  private _ovPosPool = new Map<string, { x: number; y: number }>();
+  private _ovBehind = new Set<string>();
+  private _ovNoCluster = new Set<string>();
+  private _ovInCluster = new Set<string>();
+  private _ovActive = new Set<string>();
+
+  private _updateOverlayPositions(w: number, h: number) {
+    if (this._editMode && !this._previewingRule) return;
+    // 1. Compute 2D screen positions
+    const pos2d = this._ovPos; pos2d.clear();
+    const behind = this._ovBehind; behind.clear();
+    // Ancres exclues du regroupement automatique (natures non-entité).
+    const noCluster = this._ovNoCluster; noCluster.clear();
+    const at = (name: string, x: number, y: number) => {
+      let q = this._ovPosPool.get(name);
+      if (!q) { q = { x: 0, y: 0 }; this._ovPosPool.set(name, q); }
+      q.x = x; q.y = y;
+      pos2d.set(name, q);
+    };
+    const multiFloor = !!this._plan?.floors?.length;
+    const activeFloor = this._floorIndex();
+
+    this.anchors.forEach((entry, name) => {
+      // Une pastille d'un autre étage est cachée, et n'entre dans aucun
+      // regroupement (sinon un « 2 » du rez-de-chaussée flotterait à l'étage).
+      if (multiFloor && this._floorOfY(entry.worldPos.y) !== activeFloor) { behind.add(name); return; }
+      // Vecteur de travail réutilisé : un clone par ancre et par image finissait
+      // par peser en collecte mémoire sur les scènes chargées.
+      const p = this._projScratch.copy(entry.worldPos).project(this.camera!);
+      if (p.z >= 1) { behind.add(name); return; }
+      // Seules les ancres d'entité entrent dans un regroupement : une étiquette
+      // ou une roue n'a rien à faire dans un menu radial de voisinage.
+      if ((entry.kind ?? 'entity') !== 'entity') { at(name, ((p.x + 1) / 2) * w, ((-p.y + 1) / 2) * h); noCluster.add(name); return; }
+      at(name, ((p.x + 1) / 2) * w, ((-p.y + 1) / 2) * h);
+    });
+
+    // 2. Cluster visible anchors (opt-in via cluster_threshold)
+    const threshold = this._effectiveConfig?.cluster_threshold ?? 0;
+    const inCluster = this._ovInCluster; inCluster.clear();
+    const activeIds = this._ovActive; activeIds.clear();
+
+    // Sans regroupement, inutile de construire un tableau par ancre à chaque
+    // image : aucun groupe ne peut dépasser un élément.
+    const groups = threshold > 0
+      ? this._computeClusters(
+          [...pos2d.entries()].filter(([k]) => !noCluster.has(k)),
+          threshold,
+        )
+      : [];
+
+    groups.filter(g => g.length > 1).forEach(group => {
+      const id = [...group].sort().join('|');
+      activeIds.add(id);
+      group.forEach(k => inCluster.add(k));
+
+      const cx = group.reduce((s, k) => s + pos2d.get(k)!.x, 0) / group.length;
+      const cy = group.reduce((s, k) => s + pos2d.get(k)!.y, 0) / group.length;
+
+      let clusterOv = this._clusters.get(id);
+      if (!clusterOv) {
+        clusterOv = new ClusterOverlay(this.overlayContainer!);
+        this._clusters.set(id, clusterOv);
+      }
+
+      const items: ClusterItem[] = group.map(k => {
+        const entry = this.anchors.get(k)!;
+        const desc = describeEntity(entry.entityId);
+        const st = this._hass?.states[entry.entityId];
+        return {
+          domain: entry.domain,
+          label: entry.label,
+          on: desc.isOn(st),
+          color: entry.targetColor.clone(),
+          icon: entry.icon ?? desc.icon(st),
+          onShortClick: this._getShortClickHandler(entry),
+          onLongPress: () => this._openMoreInfo(entry.entityId),
+        };
+      });
+
+      clusterOv.update(items);
+      clusterOv.updatePosition(cx, cy);
+      clusterOv.show();
+    });
+
+    // Remove stale clusters
+    this._clusters.forEach((clusterOv, id) => {
+      if (!activeIds.has(id)) { clusterOv.destroy(); this._clusters.delete(id); }
+    });
+
+    // 3. Show/hide individual overlays
+    // Distance de référence : celle du point visé, où une pastille garde sa taille.
+    const refDist = Math.max(this.camera!.position.distanceTo(this.controls?.target ?? new THREE.Vector3()), 1e-4);
+    this.anchors.forEach((_entry, name) => {
+      const ov = this.overlays.get(name);
+      if (!ov) return;
+      const entryF = this.anchors.get(name);
+      const otherFloor = !!entryF && multiFloor && this._floorOfY(entryF.worldPos.y) !== activeFloor;
+      const hide = behind.has(name) || inCluster.has(name) || otherFloor
+        || entryF?.hidden || ov.conditionHidden;
+
+      // Une roue d'actions gère elle-même son positionnement et sa visibilité :
+      // son menu ouvert doit rester en place.
+      if (ov instanceof ClusterOverlay) {
+        if (hide) { ov.hide(); return; }
+        const p = pos2d.get(name)!;
+        ov.updatePosition(p.x, p.y);
+        ov.show();
+        return;
+      }
+
+      if (hide) { ov.el.style.display = 'none'; return; }
+      const p = pos2d.get(name)!;
+
+      // Une vignette de caméra est un objet de la scène, pas un badge : sa
+      // taille suit la perspective, sinon elle semble rapetisser quand on
+      // approche — la maison grandit, elle non.
+      if (ov instanceof CameraOverlay) {
+        const entry = this.anchors.get(name)!;
+        // Largeur exprimee dans les unites du modele, quelles qu'elles soient.
+        const units = this._modelSpan * CAMERA_WIDTH_RATIO * (entry.size ?? 1);
+        const dist = this.camera!.position.distanceTo(entry.worldPos);
+        // Projection : hauteur du viewport / hauteur visible a cette distance.
+        const fov = (this.camera!.fov * Math.PI) / 180;
+        const pxPerUnit = h / (2 * Math.max(dist, 1e-4) * Math.tan(fov / 2));
+        ov.setPixelWidth(THREE.MathUtils.clamp(units * pxPerUnit, 28, 640));
+      }
+
+      ov.el.style.display = ov instanceof SensorOverlay ? 'block' : 'flex';
+      placeAt(ov.el, p.x, p.y);
+
+      // La profondeur se lit sur la taille : une pastille au fond de la maison
+      // est un peu plus petite et plus pâle qu'une pastille au premier plan.
+      // Rien n'est caché, et ce n'est qu'une division (aucun lancer de rayon).
+      if (!(ov instanceof CameraOverlay)) {
+        const entry = this.anchors.get(name)!;
+        const d = Math.max(this.camera!.position.distanceTo(entry.worldPos), 1e-4);
+        const k = THREE.MathUtils.clamp(Math.sqrt(refDist / d), 0.72, 1.15);
+        const scale = k.toFixed(2);
+        if (ov.el.style.scale !== scale) {
+          ov.el.style.scale = scale;
+          ov.el.style.opacity = String(Math.round((k < 1 ? 0.62 + 0.38 * (k - 0.72) / 0.28 : 1) * 100) / 100);
+        }
+      }
+    });
+  }
+
+  private _computeClusters(items: [string, { x: number; y: number }][], threshold: number): string[][] {
+    const groups: string[][] = [];
+    const assigned = new Set<string>();
+
+    items.forEach(([key, pos]) => {
+      if (assigned.has(key)) return;
+      const group = [key];
+      assigned.add(key);
+      items.forEach(([k2, pos2]) => {
+        if (k2 === key || assigned.has(k2)) return;
+        if (Math.hypot(pos.x - pos2.x, pos.y - pos2.y) < threshold) {
+          group.push(k2);
+          assigned.add(k2);
+        }
+      });
+      groups.push(group);
+    });
+
+    return groups;
+  }
+
+  // ── Overlays ──────────────────────────────────────────────────────────
+
+  private _createOverlays() {
+    this._clusters.forEach(c => c.destroy());
+    this._clusters.clear();
+    this.overlays.forEach((o) => o.destroy());
+    this.overlays.clear();
+
+    this.anchors.forEach((entry, name) => {
+      const kind = entry.kind ?? 'entity';
+
+      // Étiquette : texte seul, aucune entité.
+      if (kind === 'label') {
+        this.overlays.set(name, new LabelOverlay(
+          this.overlayContainer!, entry.label, entry.icon, entry.color,
+        ));
+        return;
+      }
+
+      // Ancre d'entité sans entité : un emplacement à relier. Un clic propose
+      // de choisir l'entité, plutôt que d'afficher l'état d'une entité vide.
+      if (isPlaceholder({ entity: entry.entityId, kind })) {
+        const slot = new AnchorOverlay(
+          this.overlayContainer!,
+          'default',
+          `${entry.label} · ${t('demoLinkHint')}`,
+          () => this._linkPlaceholder(name),
+          () => this._linkPlaceholder(name),
+          '',
+        );
+        slot.el.style.borderStyle = 'dashed';
+        slot.el.style.borderColor = 'rgba(125,211,252,0.7)';
+        slot.el.style.color = '#7dd3fc';
+        slot.el.style.fontSize = '20px';
+        slot.setGlyph('+');
+        slot.el.dataset.placeholder = '1';
+        this.overlays.set(name, slot);
+        return;
+      }
+
+      // Roue d'actions : le menu radial des regroupements, alimenté par les
+      // actions de l'ancre au lieu des ancres voisines.
+      if (kind === 'menu') {
+        const wheel = new ClusterOverlay(this.overlayContainer!, {
+          icon: entry.icon ?? 'mdi:dots-horizontal-circle',
+          title: entry.label,
+        });
+        wheel.update(this._buildWheelItems(entry));
+        wheel.show();
+        this.overlays.set(name, wheel);
+        return;
+      }
+
+      // Navigation : une pastille dont l'appui vole vers une vue.
+      if (kind === 'nav') {
+        this.overlays.set(name, new AnchorOverlay(
+          this.overlayContainer!,
+          'nav',
+          entry.label,
+          () => this._flyToViewId(entry.navViewId),
+          () => this._flyToViewId(entry.navViewId),
+          entry.icon ?? 'mdi:arrow-right-circle',
+        ));
+        return;
+      }
+
+      // La surcharge par ancre prime sur le descripteur : une camera peut etre
+      // ramenee a une simple pastille.
+      const wanted = entry.display && entry.display !== 'auto' ? entry.display : null;
+      const overlayKind = wanted ?? describeEntity(entry.entityId).overlay;
+
+      // Caméra : une vignette de l'image, à l'emplacement réel de l'appareil.
+      if (overlayKind === 'thumbnail') {
+        const cam = new CameraOverlay(
+          this.overlayContainer!,
+          entry.label,
+          () => this._openMoreInfo(entry.entityId),
+          t('camOffline'),
+        );
+        cam.setPicture(this._hass?.states[entry.entityId]?.attributes?.entity_picture as string | undefined);
+        this.overlays.set(name, cam);
+        return;
+      }
+
+      if (overlayKind === 'badge') {
+        const overlay = new SensorOverlay(
+          this.overlayContainer!,
+          () => this._openMoreInfo(entry.entityId),
+        );
+        this.overlays.set(name, overlay);
+        return;
+      }
+
+      const onShortClick = this._getShortClickHandler(entry);
+      const overlay = new AnchorOverlay(
+        this.overlayContainer!,
+        entry.domain,
+        entry.label,
+        onShortClick,
+        () => this._openMoreInfo(entry.entityId),
+        entry.icon,
+      );
+      this.overlays.set(name, overlay);
+    });
+  }
+
+  /**
+   * Entrees d'une roue d'actions.
+   *
+   * Reconstruites a chaque mise a jour d'etat : une valeur de capteur affichee
+   * dans la roue doit suivre l'entite, pas rester figee au chargement.
+   */
+  private _buildWheelItems(entry: AnchorEntry): ClusterItem[] {
+    return (entry.actions ?? []).map((a) => {
+      const target = this._actionTarget(a);
+      const st = target ? this._hass?.states[target] : undefined;
+      const desc = target ? describeEntity(target) : null;
+
+      // Un capteur se lit : on affiche sa valeur et son unite au lieu d'une
+      // icone qui ne dirait rien. Le texte vient du descripteur, pour qu'une
+      // entite indisponible affiche « Indisponible » et non « unavailable ».
+      const showsValue = !!desc && desc.overlay === 'badge' && !a.icon;
+      const broken = !st || st.state === 'unavailable' || st.state === 'unknown';
+      const unit = (st?.attributes?.unit_of_measurement as string) ?? '';
+      const value = showsValue
+        ? (broken ? desc!.stateText(st) : _formatSensorValue(desc!.stateText(st), undefined, target!, this._hass)) + (unit && !broken ? ` ${unit}` : '')
+        : undefined;
+
+      return {
+        domain: '',
+        // Un libellé vide se déduit de l'entité ciblée, puis du service :
+        // retaper le nom d'une entité qu'on vient de choisir n'a pas de sens.
+        label: a.label || this._actionFallbackLabel(a),
+        on: desc ? desc.isOn(st) : false,
+        color: new THREE.Color(
+          a.icon || !desc
+            ? (entry.color ?? '#7dd3fc')
+            : '#' + desc.color(st).toString(16).padStart(6, '0'),
+        ),
+        icon: a.icon ?? desc?.icon(st) ?? this._actionDefaultIcon(a),
+        value,
+        onShortClick: () => this._runAnchorAction(a),
+        onLongPress: () => this._runAnchorAction(a),
+      };
+    });
+  }
+
+  /** Entité visée par une action, quand il y en a une. */
+  private _actionTarget(a: import('./types').AnchorAction): string | undefined {
+    if (a.entity_id) return a.entity_id;
+    // Repli : les premieres roues stockaient la cible dans service_data.
+    const id = a.service_data?.entity_id;
+    return typeof id === 'string' && id ? id : undefined;
+  }
+
+  /** Libellé de repli : nom de l'entité, sinon service, sinon vue. */
+  private _actionFallbackLabel(a: import('./types').AnchorAction): string {
+    const target = this._actionTarget(a);
+    if (target) {
+      const fn = this._hass?.states[target]?.attributes?.friendly_name;
+      if (typeof fn === 'string' && fn) return fn;
+      return target.split('.')[1] ?? target;
+    }
+    if (a.type === 'view') {
+      const v = normalizeViews(this._scene?.camera_views ?? []).find((x) => x.id === a.view_id);
+      if (v) return v.label;
+    }
+    if (a.domain && a.service) return `${a.domain}.${a.service}`;
+    return t('anchorActionNew');
+  }
+
+  /** Icône de repli quand ni l'action ni l'entité n'en fournissent. */
+  private _actionDefaultIcon(a: import('./types').AnchorAction): string {
+    if (a.type === 'view') return 'mdi:video';
+    if (a.domain === 'script') return 'mdi:script-text';
+    if (a.domain === 'scene') return 'mdi:palette';
+    // Même table que le sélecteur : une entrée de roue et sa ligne de liste
+    // doivent porter la même icône.
+    const target = this._actionTarget(a);
+    if (target) return fallbackIcon(target.split('.')[0]);
+    return 'mdi:play-circle-outline';
+  }
+
+  // ── Actions d'ancres (natures menu / nav) ──────────────────────────────
+
+  /** Exécute une entrée de roue : appel de service, ou vol vers une vue. */
+  private _runAnchorAction(action: import('./types').AnchorAction) {
+    if (action.type === 'view') {
+      this._flyToViewId(action.view_id);
+      return;
+    }
+    if (action.type === 'entity') {
+      const target = this._actionTarget(action);
+      if (target) this._entityTapHandler(target)();
+      return;
+    }
+    if (!action.domain || !action.service) {
+      console.warn('[Houscape] incomplete action, ignored:', action);
+      return;
+    }
+    this._hass?.callService(action.domain, action.service, action.service_data ?? {});
+  }
+
+  /** Vole vers une vue caméra enregistrée, par identifiant. */
+  private _flyToViewId(viewId: string | undefined) {
+    if (!viewId) return;
+    const view = normalizeViews(this._scene?.camera_views ?? [])
+      .find((v) => v.id === viewId);
+    if (!view) {
+      console.warn(`[Houscape] view "${viewId}" not found.`);
+      return;
+    }
+    this._viewMgr?.flyTo(view);
+    this._ui?.setActiveView(viewId);
+  }
+
+  /** Service naturel des domaines « à déclencher ». */
+  private static readonly ACTIVATE_SERVICE: Record<string, string> = {
+    button: 'press',
+    scene: 'turn_on',
+    script: 'turn_on',
+  };
+
+  /**
+   * Effet d'un appui sur une entite, selon son descripteur.
+   *
+   * Partage entre les pastilles d'ancres et les entrees de roue : une lampe se
+   * bascule, un capteur ouvre sa fiche, et ce choix ne doit pas etre reecrit a
+   * deux endroits.
+   */
+  private _entityTapHandler(
+    entityId: string,
+    override?: import('./entities/descriptors').TapAction | 'default',
+  ): () => void {
+    if (!entityId) return () => {};
+    const domain = entityId.split('.')[0];
+    const tap = override && override !== 'default' ? override : describeEntity(entityId).tap;
+    const data = { entity_id: entityId };
+
+    switch (tap) {
+      case 'toggle':
+        return () => this._hass?.callService(domain, 'toggle', data);
+      case 'media_play_pause':
+        return () => this._hass?.callService('media_player', 'media_play_pause', data);
+      case 'activate': {
+        const service = HouscapeCard.ACTIVATE_SERVICE[domain] ?? 'turn_on';
+        return () => this._hass?.callService(domain, service, data);
+      }
+      case 'none':
+        return () => {};
+      default:
+        return () => this._openMoreInfo(entityId);
+    }
+  }
+
+  private _getShortClickHandler(entry: AnchorEntry): () => void {
+    return this._entityTapHandler(entry.entityId, entry.tapAction);
+  }
+
+  // ── Rules engine ────────────────────────────────────────────────────────
+
+  private _evaluateRules() {
+    if (!this._hass || !this._scene) return;
+    const rules = (this._scene.rules ?? []) as HouscapeRule[];
+    if (!rules.length) return;
+
+    const actions = this._ruleEngine.evaluate(rules, this._hass);
+    if (actions.length) {
+      // Trace volontaire : sans elle, une regle qui ne part pas et une regle
+      // qui part sans effet visible sont impossibles a distinguer.
+      console.debug('[Houscape] rule fired →', actions.map((a) => a.type).join(', '));
+    }
+    for (const action of actions) this._executeAction(action);
+  }
+
+  /**
+   * Exécute les actions d'une règle sans attendre son déclencheur.
+   *
+   * Utilisé par le bouton « Essayer » de l'éditeur : vérifier une règle en
+   * ouvrant physiquement une porte n'est pas une méthode de travail.
+   *
+   * Le mode édition masque les overlays. Une mise en évidence y ferait donc
+   * pulser un élément invisible, et le bouton paraîtrait sans effet — on les
+   * révèle le temps de l'aperçu.
+   */
+  runRuleNow(rule: HouscapeRule) {
+    const actions = rule.actions ?? [];
+    const highlights = actions.filter((a) => a.type === 'highlight_anchor');
+    if (highlights.length && this._editMode) {
+      const longest = highlights.reduce(
+        (m, a) => Math.max(m, (a as import('./rules/types').HighlightAnchorAction).duration ?? 6), 6);
+      this._startRulePreview(longest);
+    }
+    for (const action of actions) this._executeAction(action);
+  }
+
+  /** Révèle les overlays pendant un aperçu de règle, puis les remasque. */
+  private _startRulePreview(seconds: number) {
+    this._previewingRule = true;
+    if (this._previewTimer) clearTimeout(this._previewTimer);
+
+    if (this.canvas) {
+      this._updateOverlayPositions(this.canvas.offsetWidth, this.canvas.offsetHeight);
+    }
+    this._requestRender();
+
+    this._previewTimer = setTimeout(() => {
+      this._previewTimer = null;
+      this._previewingRule = false;
+      // Sorti de l'édition entre-temps : les overlays doivent rester visibles.
+      if (this._editMode) this.overlays.forEach((o) => { o.el.style.display = 'none'; });
+    }, (seconds + 0.5) * 1000);
+  }
+
+  /** Ancre visee par une action, par entite puis par libelle. */
+  private _findOverlayFor(target: string): AnyOverlay | null {
+    let found: AnyOverlay | null = null;
+    this.anchors.forEach((entry, key) => {
+      if (found) return;
+      if (entry.entityId === target || entry.label === target) {
+        found = this.overlays.get(key) ?? null;
+      }
+    });
+    return found;
+  }
+
+  private _executeAction(action: Action) {
+    if (!this._hass) return;
+    switch (action.type) {
+      case 'go_to_view': {
+        const views = normalizeViews(this._scene?.camera_views ?? []);
+        const view = views.find((v) => v.id === action.view_id);
+        if (view) {
+          console.debug('[Houscape] go_to_view:', view.label);
+          this._viewMgr?.flyTo(view);
+        } else {
+          console.warn('[Houscape] go_to_view: view not found:', action.view_id, 'available:', views.map(v => v.id));
+        }
+        break;
+      }
+      case 'highlight_anchor': {
+        const ov = this._findOverlayFor(action.anchor);
+        if (ov) pulseOverlay(ov.el, action.color ?? '#ef4444', (action.duration ?? 6) * 1000);
+        else console.warn('[Houscape] highlight_anchor: anchor not found:', action.anchor);
+        break;
+      }
+      case 'toast':
+        this._showToast(action.message, action.level === 'warn');
+        break;
+      case 'call_service':
+        this._hass.callService(action.domain, action.service, action.service_data ?? {});
+        break;
+    }
+  }
+
+  private _evaluatePassiveConditions() {
+    if (!this._hass) return;
+
+    // ── Cards (needs _scene) ──────────────────────────────────────────
+    if (this._scene) {
+      const cards = this._scene.cards;
+      let cardsChanged = false;
+      for (const card of cards) {
+        if (!card.visibleIf) continue;
+        const shouldBeVisible = evalCondition(card.visibleIf, this._hass);
+        const isVisible = card.visible !== false;
+        if (shouldBeVisible !== isVisible) {
+          (card as { visible: boolean }).visible = shouldBeVisible;
+          cardsChanged = true;
+        }
+      }
+      if (cardsChanged) this._cardRenderer?.syncCards(cards, this._hass);
+    }
+
+    // ── Anchors (only needs this.anchors) ────────────────────────────
+    this.anchors.forEach((entry, key) => {
+      const overlay = this.overlays.get(key);
+      if (!overlay || !('conditionHidden' in overlay)) return;
+      if (!entry.visibleIf) {
+        overlay.conditionHidden = false;
+        return;
+      }
+      overlay.conditionHidden = !evalCondition(entry.visibleIf, this._hass!);
+    });
+  }
+
+  private _updateOverlayStates() {
+    this.anchors.forEach((entry, name) => {
+      const overlay = this.overlays.get(name);
+      if (!overlay) return;
+
+      // Étiquette, roue et navigation ne reflètent aucun état d'entité — sauf
+      // une roue dont les entrées ciblent des entités.
+      const kind = entry.kind ?? 'entity';
+      if (kind !== 'entity') {
+        if (overlay instanceof LabelOverlay) overlay.updateText(entry.label);
+        if (overlay instanceof ClusterOverlay && entry.actions?.length) {
+          overlay.update(this._buildWheelItems(entry));
+        }
+        return;
+      }
+
+      // Un emplacement à relier garde son invitation : il n'a pas d'état.
+      if (overlay.el.dataset.placeholder) return;
+
+      const stateObj = this._hass?.states[entry.entityId];
+
+      if (overlay instanceof CameraOverlay) {
+        const desc = describeEntity(entry.entityId);
+        overlay.updateState(desc.isOn(stateObj), entry.label);
+        // Le token de l'URL est renouvelé par HA : on suit sans forcer.
+        overlay.setPicture(stateObj?.attributes?.entity_picture as string | undefined);
+        return;
+      }
+
+      if (overlay instanceof SensorOverlay) {
+        const rawValue = stateObj?.state ?? '\u2014';
+        const unit = (stateObj?.attributes.unit_of_measurement as string) ?? '';
+        const value = _formatSensorValue(rawValue, entry.precision, entry.entityId, this._hass);
+        overlay.setTint(deviceTint(entry.entityId, stateObj?.attributes ?? {}));
+        overlay.updateValue(value, unit, `${entry.label}: ${value}${unit}`);
+        return;
+      }
+
+      if (overlay instanceof AnchorOverlay) {
+        // Le descripteur porte l'ic\u00F4ne, le texte d'\u00E9tat et la s\u00E9mantique du
+        // \u00AB allum\u00E9 \u00BB \u2014 un capteur d'ouverture affiche donc une porte ouverte,
+        // pas un cercle bleu.
+        const desc = describeEntity(entry.entityId);
+        overlay.setStateIcon(desc.icon(stateObj), entry.domain);
+        overlay.updateState(
+          desc.isOn(stateObj),
+          entry.targetColor,
+          `${entry.label} \u2022 ${desc.stateText(stateObj)}`,
+          deviceTint(entry.entityId, stateObj?.attributes ?? {}),
+        );
+      }
+    });
+  }
+
+  private _openMoreInfo(entityId: string) {
+    this.dispatchEvent(new CustomEvent('hass-more-info', {
+      bubbles: true,
+      composed: true,
+      detail: { entityId },
+    }));
+  }
+
+  // ── Resize ────────────────────────────────────────────────────────────
+
+  private _onResize() {
+    const container = this._haCard;
+    if (!container || !this.renderer || !this.camera) return;
+    const w = container.offsetWidth;
+    const h = this._cardHeight(container, w);
+    container.style.height = `${h}px`;
+    this.renderer.setSize(w, h, false);
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    this._applyViewShift();
+    this._requestRender();
+  }
+
+  /**
+   * Largeur couverte par un panneau, en pixels : à gauche (positive) l'éditeur
+   * de plan, à droite (négative) celui de la maison. La 3D se décale d'autant
+   * pour rester dans la partie visible de la carte.
+   */
+  private _viewShift = 0;
+
+  private _applyViewShift() {
+    if (!this.camera || !this.canvas) return;
+    const w = this.canvas.clientWidth, h = this.canvas.clientHeight;
+    if (this._viewShift !== 0 && w && h) this.camera.setViewOffset(w, h, -this._viewShift / 2, 0, w, h);
+    else this.camera.clearViewOffset();
+    this._requestRender();
+  }
+
+  // ── Cleanup ───────────────────────────────────────────────────────────
+
+  private _teardown() {
+    // L'éditeur ouvert se ferme proprement : la carte quitte le plein écran.
+    this._planEditor?.close();
+    this._tour?.end();
+    this._closeWallMenu();
+    this._ui?.destroy();
+    this._ui = null;
+    this._fsReasons.clear();
+    this._exitFullscreen();
+    window.removeEventListener('keydown', this._onFullscreenKey, true);
+    cancelAnimationFrame(this.rafId);
+    this._detachDrop?.();
+    this._detachDrop = null;
+    this.ro?.disconnect();
+    window.removeEventListener('resize', this._onWindowResize);
+    if (this._editMode) this._editor?.deactivate();
+    this.controls?.dispose();
+    // La cible du PMREM appartient au contexte : on la libère avant lui.
+    // Un .hdr encore en vol ne doit plus toucher ce renderer.
+    this._cancelReflectionLoad();
+    this._releaseReflectionTarget();
+    this.renderer?.dispose();
+    this._env?.removeWeatherParticles();
+    this._env = null;
+    this._sim = null;
+    this._viewMgr = null;
+    this._editPanel = null;
+    this._cardRenderer?.dispose();
+    this._cardRenderer = null;
+    this._panelGizmo?.dispose();
+    this._panelGizmo = null;
+    this._clusters.forEach((c) => c.destroy());
+    this._clusters.clear();
+    this.overlays.forEach((o) => o.destroy());
+    this.overlays.clear();
+    this.anchors.forEach((e) => {
+      if (e.light) { this.scene?.remove(e.light); e.light.dispose(); }
+      if (e.lightTarget) this.scene?.remove(e.lightTarget);
+    });
+    this.anchors.clear();
+    this._hud?.remove();
+    this._hud = null;
+    this._hudLeft = null;
+    this._hudSep = null;
+    this._hudRight = null;
+    this._hudViews = null;
+    if (this._controlsHideTimer) clearTimeout(this._controlsHideTimer);
+    if (this._previewTimer) { clearTimeout(this._previewTimer); this._previewTimer = null; }
+    this._previewingRule = false;
+    this._io?.disconnect();
+    this._io = null;
+    if (this._onVisibility) document.removeEventListener('visibilitychange', this._onVisibility);
+    this._onVisibility = null;
+    this._paused = false;
+    this.modelLoaded = false;
+    this._editMode = false;
+    this._modelRoot = null;
+    this._camAnimTo = null;
+    this._sky = null;
+  }
+
+  disconnectedCallback() {
+    this._teardown();
+  }
+}
+
+// Garde-fou : redéfinir un custom element lève une exception. Le cas se produit
+// si le module est chargé deux fois (ressource HACS + ressource de dev, par ex.).
+const defineCard = () => {
+  if (!customElements.get('houscape-card')) {
+    customElements.define('houscape-card', HouscapeCard);
+  }
+};
+
+/**
+ * Passage de relais au serveur de développement.
+ *
+ * L'intégration charge sa carte avant les ressources Lovelace : en mode dev, la
+ * carte embarquée définissait l'élément la première et celle de Vite n'était
+ * jamais utilisée. dev-entry.ts inscrit son adresse ici ; la carte embarquée la
+ * charge alors à sa place, et reprend la main si le serveur ne répond plus.
+ */
+const DEV_KEY = 'houscape_dev_entry';
+
+let devEntry: string | null = null;
+try { devEntry = import.meta.env.DEV ? null : localStorage.getItem(DEV_KEY); } catch { /* stockage bloqué */ }
+if (devEntry) {
+  import(/* @vite-ignore */ devEntry).catch(() => {
+    try { localStorage.removeItem(DEV_KEY); } catch { /* stockage bloqué */ }
+    console.info('[Houscape] dev server unreachable, using the bundled card');
+    defineCard();
+  });
+} else {
+  defineCard();
+}
+
+/** Le fichier Sweet Home 3D d'un dépôt ou d'une sélection, s'il y en a un. */
+async function sh3dFileOf(source: FileSystemEntry[] | File[]): Promise<File | null> {
+  for (const item of source) {
+    if (item instanceof File) {
+      if (/\.sh3d$/i.test(item.name)) return item;
+    } else if (item.isFile && /\.sh3d$/i.test(item.name)) {
+      return new Promise<File>((res, rej) => (item as FileSystemFileEntry).file(res, rej));
+    }
+  }
+  return null;
+}
+
+/** Murs bas, retenus par appareil : une tablette murale et un téléphone n'ont pas le même usage. */
+const LOW_WALLS_KEY = 'houscape_low_walls';
+/** Ne plus proposer le plein écran avant d'éditer, et le choix retenu. */
+const FULL_ASK_KEY = 'houscape_edit_fullscreen_ask';
+const FULL_ASK_CHOICE = 'houscape_edit_fullscreen_choice';
+
+/** Les vues des murs : icône, nom et explication. */
+const WALL_VIEW_ICONS: Record<WallView, string> = { up: 'wallsUp', cutaway: 'wallsCut', ghost: 'wallsGhost', down: 'wallsDown' };
+
+/** La météo de Home Assistant, en clair. */
+const WEATHER_LABEL: Record<string, StringKey> = {
+  sunny: 'simWeatherClear', 'clear-night': 'uiWeatherNight', partlycloudy: 'uiWeatherPartly', cloudy: 'simWeatherCloudy',
+  rainy: 'simWeatherRain', pouring: 'simWeatherRain', 'snowy-rainy': 'simWeatherSnow', snowy: 'simWeatherSnow',
+  lightning: 'simWeatherStorm', 'lightning-rainy': 'simWeatherStorm', hail: 'simWeatherHail', fog: 'simWeatherFog',
+  windy: 'simWeatherWind', 'windy-variant': 'simWeatherWind',
+};
+
+/**
+ * Pose un menu à côté de son bouton, dans le calque de la carte : au-dessus
+ * s'il y a la place, sinon en dessous ; aligné sur le bord du bouton le plus
+ * proche du bord de la carte.
+ */
+function placePopover(menu: HTMLElement, btn: HTMLElement, host: HTMLElement) {
+  const hr = host.getBoundingClientRect(), br = btn.getBoundingClientRect();
+  const mh = menu.offsetHeight, mw = menu.offsetWidth;
+  if (br.top - hr.top > mh + 16) menu.style.bottom = `${Math.max(8, hr.bottom - br.top + 8)}px`;
+  else menu.style.top = `${Math.min(hr.height - mh - 8, br.bottom - hr.top + 8)}px`;
+  if (br.left + br.width / 2 > hr.left + hr.width / 2) menu.style.right = `${Math.max(8, hr.right - br.right)}px`;
+  else menu.style.left = `${Math.max(8, Math.min(hr.width - mw - 8, br.left - hr.left))}px`;
+}
+const WALL_VIEW_LABELS: Record<WallView, StringKey> = { up: 'wallViewUp', cutaway: 'wallViewCutaway', ghost: 'wallViewGhost', down: 'wallViewDown' };
+const WALL_VIEW_HINTS: Record<WallView, StringKey> = { up: 'wallViewUpHint', cutaway: 'wallViewCutawayHint', ghost: 'wallViewGhostHint', down: 'wallViewDownHint' };

@@ -1,0 +1,813 @@
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import type { CardConfig, Hass, CameraView, HouscapeScene } from '../types';
+import { saveScene, captureCameraView, normalizeViews } from '../scene';
+import { t } from '../i18n';
+import { icon } from '../ui/icons';
+
+export class ViewManager {
+  private _panel: HTMLDivElement | null = null;
+  private _saving = false;
+  /** Dernière vue atteinte par fly-to (HUD / nav / règles). */
+  private _activeViewId: string | null = null;
+
+  constructor(
+    private overlayContainer: HTMLElement,
+    private hudLeft: HTMLDivElement,
+    private hudSep: HTMLDivElement,
+    private getCamera: () => THREE.PerspectiveCamera | null,
+    private getControls: () => OrbitControls | null,
+    private getEffectiveConfig: () => CardConfig,
+    private getHass: () => Hass | null,
+    private getSceneId: () => string | undefined,
+    private getScene: () => HouscapeScene | null,
+    private onSceneUpdated: (scene: HouscapeScene) => void,
+    private showToast: (msg: string, err?: boolean) => void,
+    private setAnimTarget: (pos: THREE.Vector3, target: THREE.Vector3) => void,
+    private getHudRight: () => HTMLDivElement | null,
+    private getHudViews: () => HTMLElement | null = () => null,
+  ) {}
+
+  toggle() {
+    if (this._panel) {
+      this._panel.remove();
+      this._panel = null;
+    } else {
+      this._show();
+    }
+  }
+
+  private _show() {
+    this._panel?.remove();
+
+    const panel = document.createElement('div');
+    panel.style.cssText = [
+      'position:absolute', 'top:8px', 'left:8px',
+      'width:260px', 'max-height:calc(100% - 80px)',
+      'background:rgba(6,10,20,0.93)',
+      'backdrop-filter:blur(18px)', '-webkit-backdrop-filter:blur(18px)',
+      'border:1px solid rgba(255,255,255,0.09)',
+      'border-radius:14px', 'overflow:hidden',
+      'display:flex', 'flex-direction:column',
+      'z-index:15', 'pointer-events:auto',
+      'font-family:var(--primary-font-family,sans-serif)',
+      'box-shadow:0 8px 32px rgba(0,0,0,0.6)',
+    ].join(';');
+
+    // Stop typing from triggering editor shortcuts
+    panel.addEventListener('keydown', (e) => {
+      if (e.target instanceof HTMLInputElement) e.stopPropagation();
+    });
+
+    // Header
+    const header = document.createElement('div');
+    header.style.cssText = 'display:flex;align-items:center;padding:10px 12px 8px;border-bottom:1px solid rgba(255,255,255,0.07);flex-shrink:0;gap:6px;';
+    const headerTitle = document.createElement('span');
+    headerTitle.style.cssText = 'font-size:11px;font-weight:700;color:#7dd3fc;text-transform:uppercase;letter-spacing:.08em;flex:1;';
+    headerTitle.textContent = t('viewMgrTitle');
+    const closeBtn = document.createElement('button');
+    closeBtn.style.cssText = 'background:none;border:none;color:rgba(255,255,255,0.4);cursor:pointer;font-size:14px;padding:0 2px;line-height:1;';
+    closeBtn.textContent = '×';
+    closeBtn.addEventListener('click', () => { panel.remove(); this._panel = null; });
+    header.appendChild(headerTitle);
+    header.appendChild(closeBtn);
+    panel.appendChild(header);
+
+    // Capture button
+    const captureBar = document.createElement('div');
+    captureBar.style.cssText = 'padding:8px 10px;border-bottom:1px solid rgba(255,255,255,0.06);flex-shrink:0;';
+    const captureBtn = document.createElement('button');
+    captureBtn.style.cssText = [
+      'width:100%', 'background:rgba(59,130,246,0.15)',
+      'border:1px solid rgba(59,130,246,0.35)', 'border-radius:8px',
+      'color:#93c5fd', 'padding:7px 10px', 'cursor:pointer',
+      'font-size:11px', 'font-family:inherit', 'text-align:left',
+      'transition:all .15s',
+    ].join(';');
+    captureBtn.textContent = t('viewMgrSaveBtn');
+    captureBtn.addEventListener('mouseenter', () => { captureBtn.style.background = 'rgba(59,130,246,0.28)'; captureBtn.style.borderColor = 'rgba(59,130,246,0.6)'; });
+    captureBtn.addEventListener('mouseleave', () => { captureBtn.style.background = 'rgba(59,130,246,0.15)'; captureBtn.style.borderColor = 'rgba(59,130,246,0.35)'; });
+    captureBtn.addEventListener('click', () => this._capturePrompt(listBody));
+    captureBar.appendChild(captureBtn);
+    panel.appendChild(captureBar);
+
+    // List body
+    const listBody = document.createElement('div');
+    listBody.style.cssText = 'overflow-y:auto;flex:1;min-height:0;padding:4px 0;';
+    panel.appendChild(listBody);
+
+    // No scene_id warning
+    const sceneId = this.getSceneId();
+    if (!sceneId) {
+      const warn = document.createElement('div');
+      warn.style.cssText = 'padding:10px 12px;font-size:10px;color:#f59e0b;background:rgba(245,158,11,0.08);border-top:1px solid rgba(245,158,11,0.15);flex-shrink:0;';
+      warn.textContent = t('viewMgrNoSceneId');
+      panel.appendChild(warn);
+    }
+
+    this._panel = panel;
+    this.overlayContainer.appendChild(panel);
+    this._rebuildList(listBody);
+  }
+
+  private _rebuildList(listBody: HTMLElement) {
+    listBody.innerHTML = '';
+    const views = normalizeViews(this.getEffectiveConfig().camera_views ?? []);
+
+    if (views.length === 0) {
+      const empty = document.createElement('div');
+      empty.style.cssText = 'padding:18px 12px;font-size:11px;color:rgba(255,255,255,0.28);text-align:center;line-height:1.7;';
+      empty.textContent = t('viewMgrNoViews');
+      listBody.appendChild(empty);
+      return;
+    }
+
+    views.forEach((v) => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:4px;padding:6px 10px;transition:background .1s;';
+      row.addEventListener('mouseenter', () => { row.style.background = 'rgba(255,255,255,0.04)'; });
+      row.addEventListener('mouseleave', () => { row.style.background = 'transparent'; });
+
+      // Label (click = fly to)
+      const lbl = document.createElement('span');
+      lbl.style.cssText = 'flex:1;font-size:12px;color:#e2e8f0;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:4px;padding:2px 4px;transition:color .12s;';
+      lbl.textContent = v.label;
+      lbl.title = t('viewMgrFlyTitle');
+      lbl.addEventListener('mouseenter', () => { lbl.style.color = '#7dd3fc'; });
+      lbl.addEventListener('mouseleave', () => { lbl.style.color = '#e2e8f0'; });
+      lbl.addEventListener('click', () => { this.flyTo(v); this.highlightBtn(v.id); });
+      row.appendChild(lbl);
+
+      const iconBtnStyle = 'background:none;border:none;cursor:pointer;padding:3px 5px;font-size:12px;color:rgba(255,255,255,0.3);border-radius:4px;transition:all .12s;line-height:1;flex-shrink:0;';
+
+      // Fly-to button
+      const flyBtn = document.createElement('button');
+      flyBtn.style.cssText = iconBtnStyle;
+      flyBtn.textContent = '→';
+      flyBtn.title = t('viewMgrFlyTitle');
+      flyBtn.addEventListener('mouseenter', () => { flyBtn.style.color = '#7dd3fc'; flyBtn.style.background = 'rgba(125,211,252,0.1)'; });
+      flyBtn.addEventListener('mouseleave', () => { flyBtn.style.color = 'rgba(255,255,255,0.3)'; flyBtn.style.background = 'none'; });
+      flyBtn.addEventListener('click', () => { this.flyTo(v); this.highlightBtn(v.id); });
+      row.appendChild(flyBtn);
+
+      // Update (overwrite with current camera)
+      const updateBtn = document.createElement('button');
+      updateBtn.style.cssText = iconBtnStyle;
+      updateBtn.textContent = '⟳';
+      updateBtn.title = t('viewMgrOverwrite');
+      updateBtn.addEventListener('mouseenter', () => { if (!updateBtn.dataset.confirm) { updateBtn.style.color = '#4ade80'; updateBtn.style.background = 'rgba(74,222,128,0.1)'; } });
+      updateBtn.addEventListener('mouseleave', () => { if (!updateBtn.dataset.confirm) { updateBtn.style.color = 'rgba(255,255,255,0.3)'; updateBtn.style.background = 'none'; } });
+      updateBtn.addEventListener('click', () => {
+        if (updateBtn.dataset.confirm === '1') {
+          updateBtn.dataset.confirm = '';
+          updateBtn.textContent = '⟳';
+          updateBtn.style.color = 'rgba(255,255,255,0.3)';
+          updateBtn.style.background = 'none';
+          this._updateView(v.id!, listBody);
+        } else {
+          updateBtn.dataset.confirm = '1';
+          updateBtn.textContent = '✓?';
+          updateBtn.style.color = '#4ade80';
+          updateBtn.style.background = 'rgba(74,222,128,0.18)';
+          setTimeout(() => {
+            if (updateBtn.dataset.confirm === '1') {
+              updateBtn.dataset.confirm = '';
+              updateBtn.textContent = '⟳';
+              updateBtn.style.color = 'rgba(255,255,255,0.3)';
+              updateBtn.style.background = 'none';
+            }
+          }, 3000);
+        }
+      });
+      row.appendChild(updateBtn);
+
+      // Rename
+      const renameBtn = document.createElement('button');
+      renameBtn.style.cssText = iconBtnStyle;
+      renameBtn.textContent = '✎';
+      renameBtn.title = t('viewMgrRename');
+      renameBtn.addEventListener('mouseenter', () => { renameBtn.style.color = '#fbbf24'; renameBtn.style.background = 'rgba(251,191,36,0.1)'; });
+      renameBtn.addEventListener('mouseleave', () => { renameBtn.style.color = 'rgba(255,255,255,0.3)'; renameBtn.style.background = 'none'; });
+      renameBtn.addEventListener('click', () => this._renameInline(lbl, v.id!, listBody));
+      row.appendChild(renameBtn);
+
+      // Delete
+      const delBtn = document.createElement('button');
+      delBtn.style.cssText = iconBtnStyle;
+      delBtn.textContent = '✕';
+      delBtn.title = t('viewMgrDelete');
+      delBtn.addEventListener('mouseenter', () => { if (!delBtn.dataset.confirm) { delBtn.style.color = '#f87171'; delBtn.style.background = 'rgba(248,113,113,0.1)'; } });
+      delBtn.addEventListener('mouseleave', () => { if (!delBtn.dataset.confirm) { delBtn.style.color = 'rgba(255,255,255,0.3)'; delBtn.style.background = 'none'; } });
+      delBtn.addEventListener('click', () => {
+        if (delBtn.dataset.confirm === '1') {
+          this._deleteView(v.id!, listBody);
+        } else {
+          delBtn.dataset.confirm = '1';
+          delBtn.textContent = '⚠';
+          delBtn.title = t('viewMgrConfirmDelete');
+          delBtn.style.color = '#f87171';
+          delBtn.style.background = 'rgba(248,113,113,0.2)';
+          setTimeout(() => {
+            if (delBtn.dataset.confirm === '1') {
+              delBtn.dataset.confirm = '';
+              delBtn.textContent = '✕';
+              delBtn.title = t('viewMgrDelete');
+              delBtn.style.color = 'rgba(255,255,255,0.3)';
+              delBtn.style.background = 'none';
+            }
+          }, 3000);
+        }
+      });
+      row.appendChild(delBtn);
+
+      listBody.appendChild(row);
+    });
+  }
+
+  private _capturePrompt(listBody: HTMLElement) {
+    const camera = this.getCamera();
+    const controls = this.getControls();
+    if (!camera || !controls) return;
+
+    // Replace capture button temporarily with an inline input
+    const captureBar = listBody.previousElementSibling as HTMLDivElement;
+    captureBar.innerHTML = '';
+
+    const inputStyle = 'flex:1;background:rgba(255,255,255,0.06);border:1px solid rgba(125,211,252,0.4);border-radius:7px;color:#e2e8f0;padding:5px 8px;font-size:11px;font-family:inherit;outline:none;';
+    const inp = document.createElement('input');
+    inp.placeholder = t('viewMgrNamePh');
+    inp.style.cssText = inputStyle;
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:6px;';
+
+    const okBtn = document.createElement('button');
+    okBtn.textContent = '✓';
+    okBtn.style.cssText = 'background:rgba(59,130,246,0.8);border:none;border-radius:7px;color:#fff;padding:5px 10px;cursor:pointer;font-size:12px;font-family:inherit;';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.textContent = '✕';
+    cancelBtn.style.cssText = 'background:none;border:1px solid rgba(255,255,255,0.15);border-radius:7px;color:rgba(255,255,255,0.4);padding:5px 8px;cursor:pointer;font-size:12px;';
+
+    const restore = () => {
+      captureBar.innerHTML = '';
+      const btn = document.createElement('button');
+      btn.style.cssText = 'width:100%;background:rgba(59,130,246,0.15);border:1px solid rgba(59,130,246,0.35);border-radius:8px;color:#93c5fd;padding:7px 10px;cursor:pointer;font-size:11px;font-family:inherit;text-align:left;transition:all .15s;';
+      btn.textContent = t('viewMgrSaveBtn');
+      btn.addEventListener('click', () => this._capturePrompt(listBody));
+      captureBar.appendChild(btn);
+    };
+
+    const confirm = async () => {
+      const label = inp.value.trim() || 'Vue sans nom';
+      const pos = camera.position.toArray() as [number, number, number];
+      const tgt = controls.target.toArray() as [number, number, number];
+      const newView = captureCameraView(pos, tgt, label);
+      const views = normalizeViews([...(this.getEffectiveConfig().camera_views ?? []), newView]);
+      restore();
+      await this.saveViews(views, listBody);
+    };
+
+    okBtn.addEventListener('click', confirm);
+    cancelBtn.addEventListener('click', restore);
+    inp.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') confirm();
+      if (e.key === 'Escape') restore();
+    });
+
+    row.appendChild(inp); row.appendChild(okBtn); row.appendChild(cancelBtn);
+    captureBar.appendChild(row);
+    setTimeout(() => inp.focus(), 30);
+  }
+
+  private async _updateView(id: string, listBody: HTMLElement) {
+    const camera = this.getCamera();
+    const controls = this.getControls();
+    if (!camera || !controls) return;
+    const pos = camera.position.toArray() as [number, number, number];
+    const tgt = controls.target.toArray() as [number, number, number];
+    const views = normalizeViews(this.getEffectiveConfig().camera_views ?? []).map((v) =>
+      v.id === id ? { ...v, position: pos.map((x) => +x.toFixed(4)) as [number, number, number], target: tgt.map((x) => +x.toFixed(4)) as [number, number, number] } : v,
+    );
+    await this.saveViews(views, listBody);
+  }
+
+  private _renameInline(
+    lbl: HTMLSpanElement,
+    id: string,
+    listBody: HTMLElement,
+    onRebuild?: () => void,
+  ) {
+    const current = lbl.textContent ?? '';
+    const inp = document.createElement('input');
+    inp.value = current;
+    inp.style.cssText = 'flex:1;background:rgba(255,255,255,0.06);border:1px solid rgba(251,191,36,0.4);border-radius:4px;color:#e2e8f0;padding:1px 5px;font-size:12px;font-family:inherit;outline:none;width:100%;box-sizing:border-box;';
+
+    let done = false;
+    const commit = async () => {
+      if (done) return;
+      done = true;
+      const label = inp.value.trim() || current;
+      const views = normalizeViews(this.getEffectiveConfig().camera_views ?? []).map((v) =>
+        v.id === id ? { ...v, label } : v,
+      );
+      // Liste inline : rebuild dédié (évite _rebuildList du panneau flottant)
+      await this.saveViews(views, onRebuild ? undefined : listBody);
+      onRebuild?.();
+    };
+
+    const cancel = () => {
+      if (done) return;
+      done = true;
+      lbl.style.display = '';
+      inp.remove();
+    };
+
+    inp.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') { e.preventDefault(); commit(); }
+      if (e.key === 'Escape') cancel();
+    });
+    inp.addEventListener('blur', () => { void commit(); });
+
+    lbl.style.display = 'none';
+    lbl.parentElement!.insertBefore(inp, lbl);
+    setTimeout(() => { inp.focus(); inp.select(); }, 10);
+  }
+
+  private async _moveView(
+    id: string,
+    delta: -1 | 1,
+    listBody: HTMLElement,
+    container: HTMLElement,
+  ) {
+    const views = normalizeViews(this.getEffectiveConfig().camera_views ?? []);
+    const idx = views.findIndex((v) => v.id === id);
+    const next = idx + delta;
+    if (idx < 0 || next < 0 || next >= views.length) return;
+    const swapped = views.slice();
+    [swapped[idx], swapped[next]] = [swapped[next], swapped[idx]];
+    await this.saveViews(swapped, undefined);
+    this._rebuildInlineList(listBody, container);
+  }
+
+  private async _deleteView(id: string, listBody?: HTMLElement) {
+    const views = normalizeViews(this.getEffectiveConfig().camera_views ?? []).filter((v) => v.id !== id);
+    if (this._activeViewId === id) this._activeViewId = null;
+    await this.saveViews(views, listBody);
+  }
+
+  async saveViews(views: CameraView[], listBody?: HTMLElement) {
+    const sceneId = this.getSceneId();
+    const hass = this.getHass();
+    if (!sceneId || !hass) {
+      // No backend — update in-memory scene and refresh UI only
+      const scene = this.getScene();
+      if (scene) this.onSceneUpdated({ ...scene, camera_views: views });
+      if (listBody) this._rebuildList(listBody);
+      this.buildHUDBar();
+      return;
+    }
+    if (this._saving) return;
+    this._saving = true;
+    try {
+      const scene = this.getScene();
+      // Build a scene object that preserves anchors but replaces camera_views
+      const base: HouscapeScene = scene ?? {
+        version: 1, scene_id: sceneId,
+        model_url: this.getEffectiveConfig().model_url ?? '',
+        anchors: [], camera_views: [], cards: [], rules: [],
+      };
+      const updated: HouscapeScene = { ...base, camera_views: views };
+      await saveScene(hass, sceneId, updated);
+      this.onSceneUpdated(updated);
+    } catch (err) {
+      console.error('[Houscape] Failed to save views:', err);
+      this.showToast(t('viewMgrSaveError'), true);
+    } finally {
+      this._saving = false;
+    }
+    if (listBody) this._rebuildList(listBody);
+    this.buildHUDBar();
+  }
+
+  highlightBtn(id?: string) {
+    if (id) this.setActiveView(id);
+  }
+
+  setActiveView(id: string | null) {
+    this._activeViewId = id;
+    this._applyActiveChipStyles();
+    if (!id) return;
+    requestAnimationFrame(() => {
+      this._findHudBtn(id)?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+    });
+  }
+
+  /** Efface la sélection (ex. après orbit manuel). */
+  clearActiveView() {
+    if (!this._activeViewId) return;
+    this._activeViewId = null;
+    this._applyActiveChipStyles();
+  }
+
+  private _hudRoots(): HTMLElement[] {
+    const roots: HTMLElement[] = [this.hudLeft, this.hudSep];
+    const pill = this.getHudViews();
+    if (pill) roots.push(pill);
+    return roots;
+  }
+
+  private _findHudBtn(id: string): HTMLButtonElement | null {
+    const esc = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(id) : id.replace(/"/g, '\\"');
+    for (const root of this._hudRoots()) {
+      const btn = root.querySelector(`button[data-view-id="${esc}"]`);
+      if (btn) return btn as HTMLButtonElement;
+    }
+    return null;
+  }
+
+  /** En édition les chips vivent dans hudSep ; sinon dans hudLeft (puis _hudViews). */
+  private _viewsHost(): HTMLElement {
+    if (this.hudSep.style.flex === '1') {
+      // Première vue créée en édition : activer la rangée centrale
+      if (this.hudSep.style.display !== 'flex') {
+        this.hudSep.style.cssText = [
+          'flex:1', 'display:flex', 'align-items:center', 'justify-content:center',
+          'gap:4px', 'overflow-x:auto', 'max-width:100%', 'min-width:0',
+          '-webkit-overflow-scrolling:touch', 'touch-action:pan-x',
+        ].join(';');
+      }
+      return this.hudSep;
+    }
+    return this.hudLeft;
+  }
+
+  private _chipStyle(active: boolean): string {
+    return [
+      `background:${active ? 'rgba(125,211,252,0.25)' : 'transparent'}`,
+      'border:none',
+      `color:${active ? '#fff' : 'rgba(255,255,255,0.72)'}`,
+      'cursor:pointer',
+      'padding:10px 16px',
+      'font-size:14px',
+      'font-family:var(--primary-font-family,sans-serif)',
+      'border-radius:18px',
+      'transition:background .15s, color .15s',
+      'white-space:nowrap',
+      'min-height:40px',
+      'box-sizing:border-box',
+      'flex-shrink:0',
+      'line-height:1.2',
+    ].join(';');
+  }
+
+  private _applyActiveChipStyles() {
+    for (const root of this._hudRoots()) {
+      root.querySelectorAll<HTMLButtonElement>('button[data-view-id]').forEach((btn) => {
+        const active = btn.dataset.viewId === this._activeViewId;
+        btn.style.background = active ? 'rgba(125,211,252,0.25)' : 'transparent';
+        btn.style.color = active ? '#fff' : 'rgba(255,255,255,0.72)';
+      });
+    }
+  }
+
+  buildHUDBar() {
+    // Ne pas vider hudLeft entier (détruit la toolbar d'édition) — seulement les chips
+    for (const root of this._hudRoots()) {
+      root.querySelectorAll('button[data-view-id]').forEach((el) => el.remove());
+    }
+
+    const views = this.getEffectiveConfig().camera_views;
+    const visible = (views ?? []).filter((v) => !v.hidden);
+    const hasViews = visible.length > 0;
+    const hudRight = this.getHudRight();
+    const hasActions = !!(hudRight && hudRight.children.length > 0);
+    const inEditHost = this.hudSep.style.flex === '1';
+    if (!inEditHost) {
+      this.hudSep.style.display = (hasViews && hasActions) ? 'block' : 'none';
+    }
+    if (!hasViews) return;
+
+    const host = this._viewsHost();
+    visible.forEach((v) => {
+      const active = !!v.id && v.id === this._activeViewId;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      if (v.id) btn.dataset.viewId = v.id;
+      btn.textContent = v.label;
+      btn.style.cssText = this._chipStyle(active);
+      btn.addEventListener('mouseenter', () => {
+        if (btn.dataset.viewId === this._activeViewId) return;
+        btn.style.background = 'rgba(255,255,255,0.12)';
+        btn.style.color = '#fff';
+      });
+      btn.addEventListener('mouseleave', () => {
+        const on = btn.dataset.viewId === this._activeViewId;
+        btn.style.background = on ? 'rgba(125,211,252,0.25)' : 'transparent';
+        btn.style.color = on ? '#fff' : 'rgba(255,255,255,0.72)';
+      });
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.flyTo(v);
+      });
+      host.appendChild(btn);
+    });
+  }
+
+  // ── L'onglet Caméra de l'éditeur ─────────────────────────────────────────
+
+  /** Les vues, dans l'ordre où elles apparaissent sur la carte. */
+  private _views(): CameraView[] {
+    return normalizeViews(this.getEffectiveConfig().camera_views ?? []);
+  }
+
+  /** La caméra telle qu'elle est maintenant, sous forme de vue. */
+  private _currentView(label: string): CameraView | null {
+    const camera = this.getCamera();
+    const controls = this.getControls();
+    if (!camera || !controls) return null;
+    return captureCameraView(
+      camera.position.toArray() as [number, number, number],
+      controls.target.toArray() as [number, number, number],
+      label,
+    );
+  }
+
+  /**
+   * La liste des vues pour l'onglet Caméra. `list` est vidé et rempli ;
+   * `refresh` le reconstruit après chaque changement.
+   */
+  buildViewsTab(list: HTMLElement) {
+    const refresh = () => this.buildViewsTab(list);
+    const save = async (views: CameraView[]) => { await this.saveViews(views); refresh(); };
+    list.innerHTML = '';
+    const views = this._views();
+    if (!views.length) {
+      const empty = document.createElement('div');
+      empty.className = 'ow-empty';
+      const b = document.createElement('b');
+      b.textContent = t('noViews');
+      empty.append(b, document.createTextNode(t('camEmptyHint')));
+      list.appendChild(empty);
+      return;
+    }
+    views.forEach((v, i) => {
+      const row = document.createElement('div');
+      row.className = `ow-dev${v.hidden ? ' ow-off' : ''}`;
+      row.tabIndex = 0;
+      row.setAttribute('role', 'button');
+      row.title = t('viewFlyTo');
+      const tile = document.createElement('span');
+      tile.className = 'ow-tile';
+      tile.append(icon('camera', 18));
+      const col = document.createElement('span');
+      col.className = 'ow-nm';
+      const name = document.createElement('b');
+      name.textContent = v.label;
+      const sub = document.createElement('span');
+      sub.textContent = v.hidden ? t('camHiddenOnCard') : t('camShownOnCard');
+      col.append(name, sub);
+      const btns = document.createElement('span');
+      btns.className = 'ow-rowbtns';
+      const btn = (ic: string, label: string, onClick: (b: HTMLButtonElement) => void) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'ow-ib';
+        b.title = label;
+        b.setAttribute('aria-label', label);
+        b.append(icon(ic, 16));
+        b.addEventListener('click', (e) => { e.stopPropagation(); onClick(b); });
+        btns.appendChild(b);
+        return b;
+      };
+      if (i > 0) btn('up', t('camMoveUp'), () => {
+        const next = views.slice();
+        [next[i - 1], next[i]] = [next[i], next[i - 1]];
+        void save(next);
+      });
+      btn(v.hidden ? 'eyeOff' : 'eye', v.hidden ? t('viewShowInMenu') : t('viewHideFromMenu'), () =>
+        void save(views.map((x) => (x.id === v.id ? { ...x, hidden: !x.hidden } : x))));
+      btn('pencil', t('camRename'), () => {
+        const input = document.createElement('input');
+        input.value = v.label;
+        input.setAttribute('aria-label', t('camRename'));
+        input.style.cssText = 'font:600 13.5px inherit;background:var(--ow-chrome2);border:1px solid var(--ow-acc);border-radius:7px;color:var(--ow-text);padding:4px 7px;outline:none;width:100%;';
+        const done = (ok: boolean) => {
+          const label = input.value.trim();
+          if (ok && label && label !== v.label) void save(views.map((x) => (x.id === v.id ? { ...x, label } : x)));
+          else refresh();
+        };
+        input.addEventListener('keydown', (e) => {
+          e.stopPropagation();
+          if (e.key === 'Enter') done(true);
+          if (e.key === 'Escape') done(false);
+        });
+        input.addEventListener('blur', () => done(true));
+        input.addEventListener('click', (e) => e.stopPropagation());
+        name.replaceWith(input);
+        input.focus();
+        input.select();
+      });
+      btn('target', t('camRecapture'), () => {
+        const now = this._currentView(v.label);
+        if (!now) return;
+        void save(views.map((x) => (x.id === v.id ? { ...x, position: now.position, target: now.target } : x)))
+          .then(() => this.showToast(t('camRecaptured')));
+      });
+      btn('trash', t('viewDelete'), (b) => {
+        // Deux temps : le premier appui arme, le second supprime.
+        if (b.dataset.armed) { void save(views.filter((x) => x.id !== v.id)); return; }
+        b.dataset.armed = '1';
+        b.style.color = '#f87171';
+        b.title = t('camDeleteConfirm');
+        setTimeout(() => { delete b.dataset.armed; b.style.color = ''; b.title = t('viewDelete'); }, 3000);
+      });
+      row.append(tile, col, btns);
+      const go = () => this.flyTo(v);
+      row.addEventListener('click', go);
+      row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } });
+      list.appendChild(row);
+    });
+  }
+
+  /** Enregistre le point de vue actuel sous un nom ; rend `false` si la caméra manque. */
+  async captureView(label: string): Promise<boolean> {
+    const view = this._currentView(label.trim() || `${t('camDefaultName')} ${this._views().length + 1}`);
+    if (!view) return false;
+    await this.saveViews(normalizeViews([...this._views(), view]));
+    return true;
+  }
+
+  /**
+   * Build a self-contained views section for embedding in the Config tab.
+   * Includes capture button + view list. Container should be a flex column.
+   */
+  buildViewsSection(container: HTMLElement) {
+    container.innerHTML = '';
+
+    // Capture button
+    const captureBtn = document.createElement('button');
+    captureBtn.style.cssText = [
+      'width:100%', 'background:rgba(59,130,246,0.12)',
+      'border:1px solid rgba(59,130,246,0.3)', 'border-radius:8px',
+      'color:#93c5fd', 'padding:7px 10px', 'cursor:pointer',
+      'font-size:11px', 'font-family:inherit', 'text-align:left',
+      'margin-bottom:6px', 'transition:all .15s',
+    ].join(';');
+    captureBtn.textContent = t('cfgSaveView');
+    captureBtn.addEventListener('mouseenter', () => { captureBtn.style.background = 'rgba(59,130,246,0.25)'; });
+    captureBtn.addEventListener('mouseleave', () => { captureBtn.style.background = 'rgba(59,130,246,0.12)'; });
+
+    const listBody = document.createElement('div');
+    listBody.style.cssText = 'display:flex;flex-direction:column;gap:1px;';
+
+    captureBtn.addEventListener('click', () => this._captureInline(captureBtn, listBody, container));
+
+    container.appendChild(captureBtn);
+    container.appendChild(listBody);
+    this._rebuildInlineList(listBody, container);
+  }
+
+  private _rebuildInlineList(listBody: HTMLElement, container: HTMLElement) {
+    listBody.innerHTML = '';
+    const views = normalizeViews(this.getEffectiveConfig().camera_views ?? []);
+    if (views.length === 0) {
+      const empty = document.createElement('div');
+      empty.style.cssText = 'font-size:11px;color:rgba(255,255,255,0.28);text-align:center;padding:10px 0;';
+      empty.textContent = t('noViews');
+      listBody.appendChild(empty);
+      return;
+    }
+    views.forEach((v, idx) => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:2px;padding:4px 2px;';
+
+      const lbl = document.createElement('span');
+      lbl.style.cssText = 'flex:1;min-width:0;font-size:11px;color:#e2e8f0;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+      lbl.textContent = v.label;
+      lbl.title = t('viewFlyTo');
+      lbl.addEventListener('click', () => { this.flyTo(v); });
+      row.appendChild(lbl);
+
+      const btnStyle = 'background:none;border:none;cursor:pointer;padding:2px 4px;font-size:11px;color:rgba(255,255,255,0.3);border-radius:3px;transition:color .12s;flex-shrink:0;';
+      const flyBtn = document.createElement('button');
+      flyBtn.type = 'button';
+      flyBtn.style.cssText = btnStyle; flyBtn.textContent = '→'; flyBtn.title = t('viewFlyTo');
+      flyBtn.addEventListener('click', () => { this.flyTo(v); });
+      row.appendChild(flyBtn);
+
+      const upBtn = document.createElement('button');
+      upBtn.type = 'button';
+      upBtn.style.cssText = btnStyle;
+      upBtn.textContent = '↑';
+      upBtn.title = t('viewMoveUp');
+      upBtn.disabled = idx === 0;
+      if (upBtn.disabled) upBtn.style.opacity = '0.2';
+      upBtn.addEventListener('click', () => { void this._moveView(v.id!, -1, listBody, container); });
+      row.appendChild(upBtn);
+
+      const downBtn = document.createElement('button');
+      downBtn.type = 'button';
+      downBtn.style.cssText = btnStyle;
+      downBtn.textContent = '↓';
+      downBtn.title = t('viewMoveDown');
+      downBtn.disabled = idx === views.length - 1;
+      if (downBtn.disabled) downBtn.style.opacity = '0.2';
+      downBtn.addEventListener('click', () => { void this._moveView(v.id!, 1, listBody, container); });
+      row.appendChild(downBtn);
+
+      const renameBtn = document.createElement('button');
+      renameBtn.type = 'button';
+      renameBtn.style.cssText = btnStyle;
+      renameBtn.textContent = '✎';
+      renameBtn.title = t('viewRename');
+      renameBtn.addEventListener('click', () => {
+        this._renameInline(lbl, v.id!, listBody, () => this._rebuildInlineList(listBody, container));
+      });
+      row.appendChild(renameBtn);
+
+      // Hidden toggle — hides from HUD bar but keeps for rules/fly-to
+      const hideBtn = document.createElement('button');
+      hideBtn.type = 'button';
+      hideBtn.style.cssText = btnStyle;
+      hideBtn.textContent = '👁';
+      hideBtn.style.opacity = v.hidden ? '0.3' : '1';
+      hideBtn.title = v.hidden ? t('viewShowInMenu') : t('viewHideFromMenu');
+      hideBtn.addEventListener('click', async () => {
+        const next = normalizeViews(this.getEffectiveConfig().camera_views ?? []).map(
+          (x) => x.id === v.id ? { ...x, hidden: !x.hidden } : x,
+        );
+        await this.saveViews(next, undefined);
+        this._rebuildInlineList(listBody, container);
+      });
+      row.appendChild(hideBtn);
+
+      const delBtn = document.createElement('button');
+      delBtn.type = 'button';
+      delBtn.style.cssText = btnStyle; delBtn.textContent = '✕'; delBtn.title = t('viewDelete');
+      delBtn.addEventListener('click', async () => {
+        if (delBtn.dataset.confirm === '1') {
+          await this._deleteView(v.id!);
+          this._rebuildInlineList(listBody, container);
+        } else {
+          delBtn.dataset.confirm = '1'; delBtn.textContent = '⚠'; delBtn.style.color = '#f87171';
+          setTimeout(() => { delBtn.dataset.confirm = ''; delBtn.textContent = '✕'; delBtn.style.color = ''; }, 3000);
+        }
+      });
+      row.appendChild(delBtn);
+      listBody.appendChild(row);
+    });
+  }
+
+  private _captureInline(captureBtn: HTMLButtonElement, listBody: HTMLElement, container: HTMLElement) {
+    const camera = this.getCamera();
+    const controls = this.getControls();
+    if (!camera || !controls) return;
+
+    captureBtn.style.display = 'none';
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:6px;margin-bottom:6px;';
+    const inp = document.createElement('input');
+    inp.placeholder = t('viewNamePh');
+    inp.style.cssText = 'flex:1;background:rgba(255,255,255,0.07);border:1px solid rgba(125,211,252,0.4);border-radius:6px;color:#e2e8f0;padding:5px 8px;font-size:11px;font-family:inherit;outline:none;';
+    const okBtn = document.createElement('button');
+    okBtn.textContent = '✓';
+    okBtn.style.cssText = 'background:rgba(59,130,246,0.8);border:none;border-radius:6px;color:#fff;padding:5px 10px;cursor:pointer;font-size:12px;';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.textContent = '✕';
+    cancelBtn.style.cssText = 'background:none;border:1px solid rgba(255,255,255,0.15);border-radius:6px;color:rgba(255,255,255,0.4);padding:5px 8px;cursor:pointer;font-size:12px;';
+
+    const restore = () => { row.remove(); captureBtn.style.display = ''; };
+    const confirm = async () => {
+      const label = inp.value.trim() || 'View';
+      const pos = camera.position.toArray() as [number, number, number];
+      const tgt = controls.target.toArray() as [number, number, number];
+      const newView = captureCameraView(pos, tgt, label);
+      const views = normalizeViews([...(this.getEffectiveConfig().camera_views ?? []), newView]);
+      restore();
+      await this.saveViews(views, undefined);
+      this._rebuildInlineList(listBody, container);
+    };
+
+    okBtn.addEventListener('click', confirm);
+    cancelBtn.addEventListener('click', restore);
+    inp.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') confirm();
+      if (e.key === 'Escape') restore();
+    });
+
+    row.appendChild(inp); row.appendChild(okBtn); row.appendChild(cancelBtn);
+    container.insertBefore(row, captureBtn);
+    setTimeout(() => inp.focus(), 20);
+  }
+
+  flyTo(v: CameraView) {
+    if (v.id) this.setActiveView(v.id);
+    this.setAnimTarget(
+      new THREE.Vector3(...v.position),
+      new THREE.Vector3(...(v.target ?? [0, 0, 0])),
+    );
+  }
+}

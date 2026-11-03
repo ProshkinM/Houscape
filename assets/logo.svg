@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Houscape">
+  <defs>
+    <linearGradient id="g" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8b7cff"/>
+      <stop offset="1" stop-color="#42d6c5"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#g)" d="M32 4 5 25v33h54V25L32 4Z"/>
+  <path fill="#101521" fill-rule="evenodd" d="M15 29 32 16l17 13v19H39V34H25v14H15V29Zm15 10h4v9h-4v-9Z"/>
+  <path fill="#fff" opacity=".92" d="m32 8 25 19-3 4-22-17L10 31l-3-4L32 8Z"/>
+</svg>

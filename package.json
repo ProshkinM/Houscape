@@ -1,0 +1,39 @@
+{
+  "name": "houscape-card",
+  "version": "2.0.0",
+  "description": "Интерактивный 3D-дом и визуальный редактор для Home Assistant",
+  "keywords": [
+    "home-assistant",
+    "lovelace",
+    "card",
+    "3d",
+    "floorplan"
+  ],
+  "type": "module",
+  "scripts": {
+    "dev": "vite --config vite.demo.config.js",
+    "dev:card": "vite",
+    "dev:ha": "node --env-file=.env --experimental-websocket scripts/ha-dev.mjs",
+    "dev:ha:restore": "node --env-file=.env --experimental-websocket scripts/ha-dev.mjs --restore",
+    "dev:ha:status": "node --env-file=.env --experimental-websocket scripts/ha-dev.mjs --status",
+    "dev:ha:clean": "node --env-file=.env --experimental-websocket scripts/ha-dev.mjs --clean",
+    "build": "vite build && node scripts/sync-card.mjs",
+    "typecheck": "tsc --noEmit",
+    "release": "node scripts/release.mjs",
+    "preview": "vite preview",
+    "demo": "vite --config vite.demo.config.js",
+    "build:demo": "vite build --config vite.demo.config.js",
+    "test": "node scripts/test.mjs"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3",
+    "meshoptimizer": "^1.3.0",
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.183.1",
+    "@mdi/font": "^7.4.47",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Houscape",
+        "description": "Houscape stocke vos scènes 3D localement dans Home Assistant. Aucune configuration supplémentaire n’est requise."
+      }
+    },
+    "abort": {
+      "already_configured": "Houscape est déjà configuré."
+    }
+  }
+}

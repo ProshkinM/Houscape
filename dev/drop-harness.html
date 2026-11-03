@@ -1,0 +1,160 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Houscape — import par glisser-déposer</title>
+<style>
+  html, body { margin: 0; background: #0d1117; font-family: system-ui, sans-serif; }
+  pre { color: #7dd3fc; font: 11px monospace; padding: 8px 14px; white-space: pre-wrap; }
+</style>
+<div id="host"></div>
+<pre id="out">montage…</pre>
+<script type="module">
+  // La carte en maison de démonstration, un faux serveur qui assemble les
+  // tranches comme models.py, et un dépôt simulé du vrai export Sweet Home 3D.
+  //   /dev/drop-harness.html          → dépôt automatique de Modele3D/
+  //   /dev/drop-harness.html?manual   → on glisse soi-même
+  //   /dev/drop-harness.html?down     → intégration absente : ni démo ni import
+  (globalThis).__HOUSCAPE_DEMO_URL = '/custom_components/houscape/frontend/demo.glb';
+  import '/src/houscape-card.ts';
+
+  customElements.define('ha-icon', class extends HTMLElement {});
+
+  const out = document.getElementById('out');
+  const log = [];
+  const say = (s) => { log.push(s); out.textContent = log.join('\n'); };
+
+  let DOWN = new URLSearchParams(location.search).has('down');
+  window.__recover = () => { DOWN = false; };
+  let scene = { version: 1, scene_id: 'drop', model_url: '', anchors: [], camera_views: [], cards: [], rules: [], parts: [] };
+  const uploads = [];
+  let file = new Uint8Array(0);
+
+  const hass = {
+    states: {},
+    user: { is_admin: true },
+    callService() {},
+    callWS: async (msg) => {
+      if (DOWN && String(msg.type).startsWith('houscape/')) throw { code: 'unknown_command', message: 'Unknown command.' };
+      if (msg.type === 'houscape/load_scene') return scene;
+      if (msg.type === 'houscape/save_scene') { scene = msg.data; say(`scène enregistrée : model_url=${scene.model_url.slice(0, 40)}…, ${scene.anchors.length} ancres`); return { success: true }; }
+      if (msg.type === 'houscape/list_scenes') return { scenes: ['drop'] };
+      if (String(msg.type).startsWith('config/')) return [];
+      throw new Error('inconnu: ' + msg.type);
+    },
+    fetchWithAuth: async (path, init) => {
+      const q = new URLSearchParams(path.split('?')[1]);
+      const offset = Number(q.get('offset'));
+      const body = new Uint8Array(init.body);
+      uploads.push(body.length);
+      const next = new Uint8Array(offset + body.length);
+      next.set(file.subarray(0, offset)); next.set(body, offset);
+      file = next;
+      if (q.get('final') !== '1') return new Response(JSON.stringify({ received: file.length }));
+      say(`envoi : ${uploads.length} tranches, ${(file.length / 1048576).toFixed(1)} Mo, nom ${q.get('name')}`);
+      const url = URL.createObjectURL(new Blob([file], { type: 'model/gltf-binary' }));
+      return new Response(JSON.stringify({ url }));
+    },
+  };
+
+  localStorage.setItem('houscape_scene_id', 'drop');
+  const card = document.createElement('houscape-card');
+  card.style.cssText = 'display:block;width:900px;height:520px;';
+  document.getElementById('host').appendChild(card);
+  card.setConfig({ scene_id: 'drop', height: 520 });
+  card.hass = hass;
+  window.__card = card;
+
+  await new Promise((r) => setTimeout(r, 2500));
+  say(`démo chargée : ${!!card.modelLoaded}, bandeau : ${!!card.querySelector('#houscape-demo-banner')}, bouton import : ${!!card.querySelector('#houscape-demo-banner button:not(:last-child)')}`);
+
+  if (DOWN) {
+    say(`intégration absente : message ${!!card.querySelector('#houscape-backend-down')}, démo ${card._isDemo}, import possible ${card._canImport()}`);
+    window.__done = true;
+  } else if (!new URLSearchParams(location.search).has('manual')) {
+    // Tout le dossier, comme une sélection en vrac de l'explorateur.
+    //   ?plan=MaisonHA → un export de Modele3D/exports/ (voir index.json)
+    const plan = new URLSearchParams(location.search).get('plan');
+    let dir = '/Modele3D/';
+    let names;
+    if (plan) {
+      dir = `/Modele3D/exports/${plan}/`;
+      names = (await (await fetch('/Modele3D/exports/index.json')).json())[plan];
+    } else {
+      const mtlText = await (await fetch('/Modele3D/Small-flat-35mq-compressed.mtl')).text();
+      const maps = [...new Set([...mtlText.matchAll(/^\s*map_Kd\s+(.+)$/gm)].map((m) => m[1].trim().split(/[\\/ ]/).pop()))];
+      names = ['Small-flat-35mq-compressed.obj', 'Small-flat-35mq-compressed.mtl', ...maps];
+    }
+    const files = [];
+    for (const n of names) {
+      const r = await fetch(dir + n);
+      if (r.ok) files.push(new File([await r.blob()], n));
+    }
+    say(`fichiers déposés : ${files.length}`);
+
+    const dt = new DataTransfer();
+    files.forEach((f) => dt.items.add(f));
+    const haCard = card.querySelector('ha-card');
+    const t0 = performance.now();
+    haCard.dispatchEvent(new DragEvent('dragenter', { dataTransfer: dt, bubbles: true, cancelable: true }));
+    say(`voile de dépôt affiché : ${haCard.textContent.includes('Sweet Home 3D') || haCard.textContent.includes('plan')}`);
+    haCard.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+    // Pour rejouer l'import par-dessus (réimport d'un plan retouché).
+    window.__redrop = () => haCard.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+
+    // L'allègement attend une réponse : ?lighten coche la case, sinon on
+    // continue sans rien réduire.
+    const lighten = new URLSearchParams(location.search).has('lighten');
+    //   ?ask : on laisse la question affichée, pour la regarder.
+    const answer = new URLSearchParams(location.search).has('ask') ? 0 : setInterval(() => {
+      const go = [...card.querySelectorAll('button')].find((b) => /^(Continue|Continuer)$/.test(b.textContent));
+      if (!go) return;
+      const box = go.parentElement.querySelector('input[type=checkbox]');
+      if (box) box.checked = lighten;
+      say(`allègement proposé : ${go.parentElement.textContent.match(/\d+ image[^.]*\./)?.[0] ?? '?'} → ${lighten ? 'oui' : 'non'}`);
+      go.click();
+    }, 100);
+
+    // Attend la fin : plus d'import en cours et un modèle chargé.
+    while (card._importing || !card.modelLoaded) await new Promise((r) => setTimeout(r, 200));
+    clearInterval(answer);
+    await new Promise((r) => setTimeout(r, 500));
+    say(`import terminé en ${((performance.now() - t0) / 1000).toFixed(1)} s, modèle chargé : ${!!card.modelLoaded}, démo : ${card._isDemo}`);
+
+    // Ouvrants Sweet Home 3D : ajoutés comme le ferait le bouton, puis tous
+    // ouverts et contrôlés. Un battant doit pivoter sur ses vrais gonds, un
+    // coulissant rester dans son rail.
+    card.querySelectorAll('button').forEach((b) => { if (/Not now|Plus tard/.test(b.textContent)) b.click(); });
+    await card._addDetectedOpenings();
+    const { Vector3: V, Box3: B } = await import('three');
+    const parts = card._scene?.parts ?? [];
+    for (const p of parts) card._parts.preview(p.id, 1);
+    for (let i = 0; i < 40; i++) card._parts.update?.(0.1);
+    let failures = 0;
+    for (const p of parts) {
+      const item = card._parts.items.find((i) => i.cfg.id === p.id);
+      if (!item) { failures++; say(`  ${p.label} : non monté ❌`); continue; }
+      const info = item.target.userData.houscapeLeaf;
+      const ab = info.axisBox;
+      const width = info.size[1];
+      if (p.motion === 'swing') {
+        const axisC = card._modelRoot.localToWorld(new V(
+          (ab.min[0] + ab.max[0]) / 2, (ab.min[1] + ab.max[1]) / 2, (ab.min[2] + ab.max[2]) / 2));
+        const piv = item.pivotNode.getWorldPosition(new V());
+        const d = Math.hypot(piv.x - axisC.x, piv.z - axisC.z);
+        const ok = d / width < 0.25;
+        if (!ok) failures++;
+        say(`  ${p.label} : battant ${p.hinge}/${p.swingSide ?? 'front'}, pivot à ${Math.round(d)} des gonds (largeur ${Math.round(width)}) ${ok ? 'OK' : '❌'}`);
+      } else {
+        const ob = new B().setFromObject(item.pivotNode);
+        const oc = ob.getCenter(new V());
+        const rail = new B(card._modelRoot.localToWorld(new V(...ab.min)), card._modelRoot.localToWorld(new V(...ab.max)));
+        rail.expandByScalar(width * 0.15);
+        const ok = oc.x >= rail.min.x && oc.x <= rail.max.x && oc.z >= rail.min.z && oc.z <= rail.max.z;
+        if (!ok) failures++;
+        say(`  ${p.label} : coulissant ${p.slide}, ouvert ${ok ? 'dans son rail OK' : 'hors du rail ❌'}`);
+      }
+    }
+    say(`ouvrants : ${parts.length}, échecs : ${failures}`);
+    window.__failures = failures;
+    window.__done = true;
+  }
+</script>
