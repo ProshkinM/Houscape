@@ -10,6 +10,8 @@
   [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 </div>
 
+<p align="center"><strong>English</strong> · <a href="README_RU.md">Русский</a></p>
+
 Houscape turns a Home Assistant dashboard into a live 3D model of your home. Draw a floor plan directly in the browser or import an existing model, then connect lights, sensors, climate devices, doors, windows, cameras, and automations to real Home Assistant entities.
 
 > [!IMPORTANT]
@@ -50,21 +52,40 @@ Houscape turns a Home Assistant dashboard into a live 3D model of your home. Dra
 
 ## Installation
 
+Requires **Home Assistant 2024.1 or newer**. Houscape is installed as an integration and includes its Lovelace card; you do not need to add a separate dashboard resource.
+
 ### HACS (recommended)
+
+[![Open the Houscape repository in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=ProshkinM&repository=Houscape&category=integration)
+
+[![Add the Houscape integration](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=houscape)
+
+1. Select the first button, confirm adding the custom repository, and choose **Download**.
+2. Restart Home Assistant.
+3. Select the second button and complete the integration setup.
+4. Force-refresh the browser with `Ctrl+Shift+R` (`Cmd+Shift+R` on macOS).
+
+<details>
+<summary>Install with HACS without the buttons</summary>
 
 1. Open **HACS → Integrations**.
 2. Open the three-dot menu and choose **Custom repositories**.
-3. Add `https://github.com/ProshkinM/houscape` with category **Integration**.
-4. Search for **Houscape** and install it.
-5. Restart Home Assistant.
-6. Open **Settings → Devices & services → Add integration**, search for **Houscape**, and complete the setup.
+3. Add `https://github.com/ProshkinM/Houscape` with category **Integration**.
+4. Search for **Houscape**, select **Download**, and restart Home Assistant.
+5. Open **Settings → Devices & services → Add integration**, search for **Houscape**, and complete the setup.
+
+</details>
+
+> [!NOTE]
+> Choose the **Integration** category in HACS. The Lovelace card is bundled with the integration; there is no separate card download or resource URL to add.
 
 ### Manual installation
 
-1. Download the latest release source archive.
+1. Download the source archive from the [latest release](https://github.com/ProshkinM/Houscape/releases/latest).
 2. Copy `custom_components/houscape` to `<config>/custom_components/houscape`.
 3. Restart Home Assistant.
-4. Add the **Houscape** integration from **Settings → Devices & services**.
+4. Add **Houscape** from **Settings → Devices & services → Add integration**.
+5. Force-refresh the browser after upgrading.
 
 ## Add the card
 
