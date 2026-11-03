@@ -451,7 +451,7 @@ export class EditPanel {
     private hudLeft: HTMLDivElement,
     private hudRight: HTMLDivElement,
     private hudSep: HTMLDivElement,
-    private cardContainer: HTMLElement,
+    private cardContainer: HTMLElement | null,
     private getEditor: () => AnchorEditor | null,
     private getHass: () => Hass | null,
     private getConfig: () => CardConfig | null,
@@ -583,6 +583,11 @@ export class EditPanel {
 
   private _tabs() { return editorTabs(!!this.onDrawPlan); }
 
+  /** Stable layout host while the plan editor temporarily replaces <ha-card>. */
+  private _layoutContainer(): HTMLElement {
+    return this.cardContainer ?? this.overlayContainer.parentElement ?? this.overlayContainer;
+  }
+
   showToolbar() {
     // L'ancienne barre du bas n'a plus de rôle en édition.
     this.hud.style.display = 'none';
@@ -616,8 +621,12 @@ export class EditPanel {
       this._liveForm?.();
     }, 400);
     this._tour = new Tour(this.overlayContainer);
+    this._widthObs?.disconnect();
     this._widthObs = new ResizeObserver(() => this._applyWidth());
-    this._widthObs.observe(this.cardContainer);
+    // Be defensive around fast plan ↔ inspector transitions. The owner uses a
+    // stable host fallback, but integrations embedding the panel may still
+    // detach their container while this method is running.
+    this._widthObs.observe(this._layoutContainer());
     this._applyWidth();
     this._offerTour();
   }
@@ -791,21 +800,22 @@ export class EditPanel {
 
   /** Sur une carte étroite, le panneau passe par-dessus la 3D et s'ouvre à la demande. */
   private _applyWidth() {
-    const narrow = this.cardContainer.clientWidth < 760;
+    const container = this._layoutContainer();
+    const narrow = container.clientWidth < 760;
     if (narrow !== this._narrow) {
       this._narrow = narrow;
       if (!narrow) this._panelOpen = false;
     }
     // Un téléphone : les onglets prennent toute une ligne, la barre double de hauteur.
-    const phone = this.cardContainer.clientWidth < 560;
+    const phone = container.clientWidth < 560;
     this._bar?.classList.toggle('ow-narrow', narrow);
     this._bar?.classList.toggle('ow-phone', phone);
     this._panel?.classList.toggle('ow-narrow', narrow);
     this._panel?.classList.toggle('ow-phone', phone);
-    this.cardContainer.style.setProperty('--ow-bar-h', `${phone ? BAR_H_PHONE : BAR_H}px`);
+    container.style.setProperty('--ow-bar-h', `${phone ? BAR_H_PHONE : BAR_H}px`);
     this._panel?.classList.toggle('ow-panel-open', this._panelOpen);
     if (this._panel) this._panel.style.width = narrow ? '' : `${this._panelW}px`;
-    this.cardContainer.style.setProperty('--ow-dock', `${narrow ? 0 : this._panelW}px`);
+    container.style.setProperty('--ow-dock', `${narrow ? 0 : this._panelW}px`);
     this.onDock?.(narrow ? 0 : this._panelW);
   }
 
@@ -981,8 +991,9 @@ export class EditPanel {
     this._bar = null;
     this._floorsEl?.remove();
     this._floorsEl = null;
-    this.cardContainer.style.removeProperty('--ow-dock');
-    this.cardContainer.style.removeProperty('--ow-bar-h');
+    const container = this._layoutContainer();
+    container.style.removeProperty('--ow-dock');
+    container.style.removeProperty('--ow-bar-h');
     this.onDock?.(0);
     this.hud.querySelector('#editor-hint-bar')?.remove();
     // Restore HUD to normal camera view + action buttons
@@ -3349,7 +3360,8 @@ export class EditPanel {
   }
 
   showStatusBar(text: string) {
-    let bar = this.cardContainer.querySelector<HTMLElement>('#editor-status-bar');
+    const container = this._layoutContainer();
+    let bar = container.querySelector<HTMLElement>('#editor-status-bar');
     if (!bar) {
       bar = document.createElement('div');
       bar.id = 'editor-status-bar';
@@ -3368,14 +3380,14 @@ export class EditPanel {
         zIndex: '100',
         letterSpacing: '0.03em',
       });
-      this.cardContainer.appendChild(bar);
+      container.appendChild(bar);
     }
     bar.textContent = text;
     bar.style.display = 'block';
   }
 
   hideStatusBar() {
-    const bar = this.cardContainer.querySelector<HTMLElement>('#editor-status-bar');
+    const bar = this._layoutContainer().querySelector<HTMLElement>('#editor-status-bar');
     if (bar) bar.style.display = 'none';
   }
 

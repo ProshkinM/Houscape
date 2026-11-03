@@ -223,6 +223,11 @@ const CLOUDS: Record<Exclude<SkyLook, 'studio'>, { count: number; size: number; 
   overcast: { count: 54, size: 1.6, tint: { day: 0xc3c9d1, dusk: 0x8f8088, night: 0x161b27 } },
 };
 
+/** Preserve already non-indexed geometry; convert only when faces share indices. */
+export function asNonIndexed(geometry: THREE.BufferGeometry): THREE.BufferGeometry {
+  return geometry.index ? geometry.toNonIndexed() : geometry;
+}
+
 /**
  * Des nuages en volumes à facettes, comme les arbres du jardin et la maison :
  * un ciel photographié jurait avec le reste, des taches floues faisaient faux.
@@ -240,7 +245,11 @@ export class SkyClouds {
 
   constructor() {
     // Une boule à facettes ; chaque face porte une seule teinte, selon qu'elle regarde le ciel ou le sol.
-    const geo = new THREE.IcosahedronGeometry(1, 1).toNonIndexed();
+    const source = new THREE.IcosahedronGeometry(1, 1);
+    // Three.js already creates this geometry without an index in current
+    // releases. Converting it again logs a warning and needlessly walks every
+    // vertex; keep compatibility with older releases that returned an index.
+    const geo = asNonIndexed(source);
     geo.computeVertexNormals();
     const n = geo.getAttribute('normal');
     const col = new Float32Array(n.count * 3);

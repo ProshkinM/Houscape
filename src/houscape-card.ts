@@ -2018,7 +2018,11 @@ export class HouscapeCard extends HTMLElement {
   }
 
   private _showSetupOverlay() {
-    const card = this.querySelector('ha-card') as HTMLElement;
+    // The plan editor temporarily replaces the inner <ha-card>. When the user
+    // switches back quickly, the editor toolbar can be rebuilt one microtask
+    // before that node is restored. The custom element host is stable and is a
+    // safe sizing/CSS-variable fallback for that transition.
+    const card = this.querySelector<HTMLElement>('ha-card') ?? this;
     if (!card) return;
 
     const overlay = document.createElement('div');

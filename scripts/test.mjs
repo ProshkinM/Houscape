@@ -50,6 +50,7 @@ const ENTRIES = [
   'src/import/lighten.ts',
   'src/import/sh3d-parts.ts',
   'src/card/lovelace-config.ts',
+  'src/card/sky-paint.ts',
   'src/plan/build.ts',
   'src/plan/graph.ts',
   'src/plan/migrate.ts',
